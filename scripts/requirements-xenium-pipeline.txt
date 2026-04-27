@@ -1,0 +1,4 @@
+# For scripts/xenium_subset_to_spatialvis.py (in addition to backend deps: numpy pandas pyarrow shapely pillow)
+h5py>=3.10
+scipy>=1.11
+tifffile>=2024.1.30
