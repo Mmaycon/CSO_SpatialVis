@@ -16,7 +16,8 @@ class Settings(BaseSettings):
     # Local dev defaults to SQLite under ./data so ROI annotations persist without Postgres.
     database_url: str = f"sqlite:///{_DEFAULT_SQLITE}"
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "*"]
-    max_cells_per_viewport: int = 500_000
+    max_cells_per_viewport: int = 150_000
+    max_polygons_per_viewport: int = 100_000
     gene_cache_size: int = 32
 
 

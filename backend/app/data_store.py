@@ -11,6 +11,8 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
+import pyarrow as pa
+import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from pydantic import TypeAdapter
 
@@ -47,6 +49,62 @@ def sample_dir(sample_id: str) -> Path:
     return d
 
 
+_parquet_table_cache: dict[str, tuple[float, pa.Table]] = {}
+_meta_index_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+_polygon_frame_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+_pathology_tags_cache: dict[str, tuple[float, pd.DataFrame]] = {}
+
+
+def _cache_path_key(path: Path) -> str:
+    return str(path.resolve())
+
+
+def _read_cells_table_cached(cells_path: Path) -> pa.Table:
+    key = _cache_path_key(cells_path)
+    mtime = cells_path.stat().st_mtime
+    hit = _parquet_table_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    t = pq.read_table(cells_path, columns=["cell_id", "x", "y"], memory_map=True)
+    _parquet_table_cache[key] = (mtime, t)
+    return t
+
+
+def _read_cell_metadata_index_cached(meta_path: Path) -> pd.DataFrame:
+    key = _cache_path_key(meta_path)
+    mtime = meta_path.stat().st_mtime
+    hit = _meta_index_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    meta_tbl = pq.read_table(meta_path, memory_map=True)
+    meta_df = meta_tbl.to_pandas().set_index("cell_id")
+    meta_df.index = meta_df.index.map(str)
+    _meta_index_cache[key] = (mtime, meta_df)
+    return meta_df
+
+
+def _read_polygon_dataframe_cached(path: Path) -> pd.DataFrame:
+    key = _cache_path_key(path)
+    mtime = path.stat().st_mtime
+    hit = _polygon_frame_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    df = pq.read_table(path, memory_map=True).to_pandas()
+    _polygon_frame_cache[key] = (mtime, df)
+    return df
+
+
+def _read_pathology_tags_df_cached(p: Path) -> pd.DataFrame:
+    key = _cache_path_key(p)
+    mtime = p.stat().st_mtime
+    hit = _pathology_tags_cache.get(key)
+    if hit and hit[0] == mtime:
+        return hit[1]
+    df = pq.read_table(p, memory_map=True).to_pandas()
+    _pathology_tags_cache[key] = (mtime, df)
+    return df
+
+
 def read_cells_viewport(
     sample_id: str,
     min_x: float,
@@ -59,34 +117,53 @@ def read_cells_viewport(
     if not cells_path.exists():
         return [], 0, False
 
-    table = pq.read_table(cells_path, columns=["cell_id", "x", "y"])
-    df = table.to_pandas()
-
-    mask = (
-        (df["x"] >= min_x)
-        & (df["x"] <= max_x)
-        & (df["y"] >= min_y)
-        & (df["y"] <= max_y)
+    table = _read_cells_table_cached(cells_path)
+    x = table["x"]
+    y = table["y"]
+    # Use pc.and_ — ChunkedArray from parquet cannot be combined with Python &.
+    mask = pc.and_(
+        pc.and_(pc.greater_equal(x, min_x), pc.less_equal(x, max_x)),
+        pc.and_(pc.greater_equal(y, min_y), pc.less_equal(y, max_y)),
     )
-    sub = df.loc[mask]
-    total = int(len(sub))
+    filtered = table.filter(mask)
+    total = int(filtered.num_rows)
+    if total == 0:
+        return [], 0, False
+
     truncated = total > max_cells
     if truncated:
-        sub = sub.sample(n=max_cells, random_state=42)
+        idx = np.sort(np.random.default_rng(42).choice(total, size=max_cells, replace=False))
+        filtered = filtered.take(pa.array(idx, type=pa.uint32()))
+
+    n = int(filtered.num_rows)
+    cell_ids: list[str] = [str(c) for c in filtered["cell_id"].to_pylist()]
+    xs = np.ascontiguousarray(np.asarray(filtered["x"].to_numpy(zero_copy_only=False), dtype=np.float64))
+    ys = np.ascontiguousarray(np.asarray(filtered["y"].to_numpy(zero_copy_only=False), dtype=np.float64))
 
     meta_path = sample_dir(sample_id) / "cell_metadata.parquet"
-    meta_df = None
+    meta_df: pd.DataFrame | None = None
     if meta_path.exists():
-        meta_tbl = pq.read_table(meta_path)
-        meta_df = meta_tbl.to_pandas().set_index("cell_id")
+        meta_df = _read_cell_metadata_index_cached(meta_path)
 
     rows: list[dict[str, Any]] = []
-    for _, r in sub.iterrows():
-        cid = str(r["cell_id"])
-        md: dict[str, Any] = {}
-        if meta_df is not None and cid in meta_df.index:
-            md = meta_df.loc[cid].to_dict()
-        rows.append({"cell_id": cid, "x": float(r["x"]), "y": float(r["y"]), "metadata": md})
+    if meta_df is not None:
+        for i in range(n):
+            cid = cell_ids[i]
+            if cid in meta_df.index:
+                md = meta_df.loc[cid].to_dict()
+            else:
+                md = {}
+            rows.append({"cell_id": cid, "x": float(xs[i]), "y": float(ys[i]), "metadata": md})
+    else:
+        for i in range(n):
+            rows.append(
+                {
+                    "cell_id": cell_ids[i],
+                    "x": float(xs[i]),
+                    "y": float(ys[i]),
+                    "metadata": {},
+                }
+            )
 
     return rows, total, truncated
 
@@ -98,52 +175,142 @@ def read_polygons_viewport(
     min_y: float,
     max_x: float,
     max_y: float,
-) -> list[dict[str, Any]]:
+    max_features: int,
+) -> tuple[list[dict[str, Any]], int, bool]:
     lod = max(0, min(2, lod))
     path = sample_dir(sample_id) / f"polygons_lod{lod}.parquet"
     if not path.exists():
         path = sample_dir(sample_id) / "polygons_lod0.parquet"
     if not path.exists():
-        return []
+        return [], 0, False
 
-    df = pq.read_table(path).to_pandas()
-    feats: list[dict[str, Any]] = []
-
-    # Expect columns: id, geometry_json or wkt, props
-    for _, r in df.iterrows():
-        gj = r.get("geometry_json")
-        if gj is None and "wkt" in df.columns:
-            from shapely import wkt
-
-            g = wkt.loads(str(r["wkt"]))
-            gj = json.loads(json.dumps(g.__geo_interface__))
-        elif isinstance(gj, str):
-            gj = json.loads(gj)
-
-        xs, ys = _bbox_of_geometry(gj)
-        if xs[1] < min_x or xs[0] > max_x or ys[1] < min_y or ys[0] > max_y:
-            continue
-
-        pid = str(r.get("id", r.name))
-        props = {}
-        if "cell_id" in r:
-            props["cell_id"] = str(r["cell_id"])
-        feats.append(
-            {
-                "id": pid,
-                "geometry": gj,
-                "properties": props,
-            }
+    df = _read_polygon_dataframe_cached(path)
+    has_precomputed_bbox = {"min_x", "min_y", "max_x", "max_y"}.issubset(df.columns)
+    if has_precomputed_bbox:
+        m = (
+            (df["max_x"] >= min_x)
+            & (df["min_x"] <= max_x)
+            & (df["max_y"] >= min_y)
+            & (df["min_y"] <= max_y)
         )
-    return feats
+        work = df.loc[m]
+        total = int(len(work))
+        truncated = total > max_features
+        if total > 0 and truncated:
+            work = work.sample(n=max_features, random_state=42)
+    else:
+        work = df
+        total = 0
+        truncated = False  # set after list built
+
+    feats: list[dict[str, Any]] = []
+    has_wkt = "wkt" in work.columns
+    if has_wkt:
+        from shapely import wkt as shapely_wkt
+
+    if has_precomputed_bbox:
+        for idx, r in work.iterrows():
+            gj = r.get("geometry_json")
+            if gj is None and has_wkt and r.get("wkt") is not None:
+                g = shapely_wkt.loads(str(r["wkt"]))
+                gj = json.loads(json.dumps(g.__geo_interface__))
+            elif isinstance(gj, str):
+                gj = json.loads(gj)
+            if gj is None:
+                continue
+            pid = str(r.get("id", idx))
+            props: dict[str, Any] = {}
+            if "cell_id" in r and r.get("cell_id") is not None:
+                props["cell_id"] = str(r["cell_id"])
+            feats.append(
+                {
+                    "id": pid,
+                    "geometry": gj,
+                    "properties": props,
+                }
+            )
+    else:
+        for idx, r in work.iterrows():
+            gj = r.get("geometry_json")
+            if gj is None and has_wkt and r.get("wkt") is not None:
+                g = shapely_wkt.loads(str(r["wkt"]))
+                gj = json.loads(json.dumps(g.__geo_interface__))
+            elif isinstance(gj, str):
+                gj = json.loads(gj)
+
+            if gj is None:
+                continue
+            xs, ys = _bbox_of_geometry(gj)
+            if xs[1] < min_x or xs[0] > max_x or ys[1] < min_y or ys[0] > max_y:
+                continue
+
+            pid = str(r.get("id", idx))
+            props: dict[str, Any] = {}
+            if "cell_id" in r and r.get("cell_id") is not None:
+                props["cell_id"] = str(r["cell_id"])
+            feats.append(
+                {
+                    "id": pid,
+                    "geometry": gj,
+                    "properties": props,
+                }
+            )
+        total = int(len(feats))
+        truncated = total > max_features
+        if total > max_features and max_features > 0:
+            idx = np.sort(np.random.default_rng(42).choice(total, size=max_features, replace=False))
+            feats = [feats[i] for i in idx]
+
+    return feats, total, truncated
 
 
 def _bbox_of_geometry(g: dict[str, Any]) -> tuple[tuple[float, float], tuple[float, float]]:
+    b = _try_bbox_geojson_fast(g)
+    if b is not None:
+        (minx, miny, maxx, maxy) = b
+        return (minx, maxx), (miny, maxy)
     from shapely.geometry import shape
 
     s = shape(g)
     minx, miny, maxx, maxy = s.bounds
     return (minx, maxx), (miny, maxy)
+
+
+def _try_bbox_geojson_fast(g: dict[str, Any]) -> tuple[float, float, float, float] | None:
+    """Bounds without Shapely for common Polygon / MultiPolygon GeoJSON (large speedup vs shape())."""
+    try:
+        t = g.get("type")
+        coords = g.get("coordinates")
+        if t == "Polygon" and isinstance(coords, list) and coords:
+            ring0 = coords[0]
+            if not ring0 or not isinstance(ring0, list):
+                return None
+            xs = [float(p[0]) for p in ring0 if len(p) >= 2]
+            ys = [float(p[1]) for p in ring0 if len(p) >= 2]
+            if not xs:
+                return None
+            return (min(xs), min(ys), max(xs), max(ys))
+        if t == "MultiPolygon" and isinstance(coords, list) and coords:
+            minx = miny = float("inf")
+            maxx = maxy = float("-inf")
+            for poly in coords:
+                if not poly or not isinstance(poly, list):
+                    continue
+                ring0 = poly[0]
+                if not ring0:
+                    continue
+                for p in ring0:
+                    if not isinstance(p, (list, tuple)) or len(p) < 2:
+                        continue
+                    x, y = float(p[0]), float(p[1])
+                    minx, maxx = min(minx, x), max(maxx, x)
+                    miny, maxy = min(miny, y), max(maxy, y)
+            if not (minx < float("inf") and maxx > float("-inf")):
+                return None
+            return (minx, miny, maxx, maxy)
+    except (TypeError, ValueError, KeyError):
+        return None
+    return None
 
 
 def read_transcript_tile(sample_id: str, z: int, x: int, y: int) -> list[tuple[float, float, str]]:
@@ -191,11 +358,12 @@ def read_gene_expression(sample_id: str, gene: str, cell_ids: list[str] | None) 
         sid = set(cell_ids)
         df = df[df["cell_id"].astype(str).isin(sid)]
 
-    vals: dict[str, float] = {}
-    for _, r in df.iterrows():
-        v = r[resolved_gene_col]
-        if pd.notna(v):
-            vals[str(r["cell_id"])] = float(v)
+    cids = df["cell_id"].astype(str)
+    gcol = df[resolved_gene_col]
+    mask = gcol.notna()
+    cids2 = cids[mask]
+    g2 = gcol[mask]
+    vals = {str(c): float(v) for c, v in zip(cids2.tolist(), g2.tolist(), strict=True)}
 
     if cell_ids is None and len(vals) < 500_000:
         _gene_column_cache[key] = vals
@@ -378,13 +546,16 @@ def sync_sample_roi_parquet_from_tags(
 def overlay_pathology_metadata(sample_id: str, cell_ids: list[str]) -> dict[str, dict[str, Any]]:
     """Merge precomputed tags file with empty default."""
     p = sample_dir(sample_id) / "pathology_cell_tags.parquet"
-    if not p.exists():
+    if not p.exists() or not cell_ids:
         return {c: {} for c in cell_ids}
-    df = pq.read_table(p).to_pandas()
-    df = df[df["cell_id"].astype(str).isin(set(cell_ids))]
+    want = set(cell_ids)
+    df = _read_pathology_tags_df_cached(p)
+    df = df[df["cell_id"].astype(str).isin(want)]
     out: dict[str, dict[str, Any]] = {c: {} for c in cell_ids}
     for _, r in df.iterrows():
         cid = str(r["cell_id"])
+        if cid not in out:
+            continue
         out[cid] = {
             k: r[k]
             for k in df.columns

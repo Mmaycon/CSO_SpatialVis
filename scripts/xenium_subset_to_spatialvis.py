@@ -12,7 +12,14 @@ Example:
     --out-dir  /path/to/CSO_SpatialVis/data/xenium_511Tumor_5k \\
     --n-cells 5000
 
+By default, random cells are drawn only from IDs that appear in both ``cells.*`` and the feature
+matrix barcodes, so expression rows match centroids/metadata. Use
+``--ignore-matrix-barcode-filter`` to sample from all cells in the table (missing matrix IDs get
+zeros in expression-wide).
+
 Optional: append the printed manifest sample JSON block to data/manifest.json (version 1.0, samples[]).
+
+For **no** random subsampling (export every cell in the pool), use ``scripts/xenium_to_spatialvis.py``.
 """
 
 from __future__ import annotations
@@ -22,6 +29,7 @@ import json
 import math
 import sys
 from collections import defaultdict
+from collections.abc import Sequence
 from pathlib import Path
 from typing import Any
 
@@ -86,10 +94,20 @@ def _read_cells(xenium: Path) -> pd.DataFrame:
 
 
 def _sample_ids(cell_ids: list[str], n: int, seed: int) -> list[str]:
+    """Uniform random subset of up to n distinct cell IDs, listed in the same order as the pool.
+
+    (Pool order = first-seen order from `cell_ids` after de-duplication.) The subset of IDs is
+    random; their relative order in the result follows the pool so rows stay aligned with tables.
+    """
     rng = np.random.default_rng(seed)
     ids = list(dict.fromkeys(str(x) for x in cell_ids))
-    n = min(n, len(ids))
-    return list(rng.choice(np.array(ids, dtype=object), size=n, replace=False))
+    n = min(int(n), len(ids))
+    if n == 0:
+        return []
+    if n == len(ids):
+        return list(ids)
+    pick = np.sort(rng.choice(len(ids), size=n, replace=False))
+    return [ids[int(i)] for i in pick]
 
 
 def _read_feature_matrix_h5(
@@ -163,18 +181,66 @@ def _read_feature_matrix_mex(mex_dir: Path) -> tuple[Any, list[str], list[str], 
     return mat, barcodes, names, gene_mask
 
 
+def _find_feature_matrix_h5(xenium: Path) -> Path | None:
+    p = _find_file(
+        xenium,
+        [
+            "cell_feature_matrix.h5",
+            "cell_feature_matrix/cell_feature_matrix.h5",
+        ],
+    )
+    if p is None:
+        p = xenium / "cell_feature_matrix" / "cell_feature_matrix.h5"
+    return p if p.exists() else None
+
+
+def _read_barcodes_h5_only(h5_path: Path) -> list[str]:
+    h5py, _ = _require_scipy_h5py()
+    f = h5py.File(h5_path, "r")
+    try:
+        raw = f["matrix"]["barcodes"][:]
+        return [
+            b.decode() if isinstance(b, (bytes, bytearray)) else str(b) for b in raw
+        ]
+    finally:
+        f.close()
+
+
+def _read_barcodes_mex_only(mex_dir: Path) -> list[str] | None:
+    bpath = mex_dir / "barcodes.tsv.gz"
+    if not bpath.exists():
+        bpath = mex_dir / "barcodes.tsv"
+    if not bpath.exists():
+        return None
+    bdf = pd.read_csv(bpath, sep="\t", header=None, names=["cell_id"])
+    return bdf["cell_id"].astype(str).tolist()
+
+
+def _matrix_barcodes_set(xenium: Path) -> set[str] | None:
+    """Barcode set from feature matrix (H5 or MEX) if present, else None."""
+    h5p = _find_feature_matrix_h5(xenium)
+    if h5p is not None:
+        return set(_read_barcodes_h5_only(h5p))
+    mex_dir = xenium / "cell_feature_matrix"
+    if (mex_dir / "matrix.mtx.gz").exists() or (mex_dir / "matrix.mtx").exists():
+        b = _read_barcodes_mex_only(mex_dir)
+        if b is not None:
+            return set(b)
+    return None
+
+
 def _expression_wide_from_h5(
     h5_path: Path,
-    wanted_ids: set[str],
+    cell_id_order: Sequence[str],
 ) -> pd.DataFrame:
     mat, barcodes, names, gene_mask = _read_feature_matrix_h5(h5_path)
     col = {b: j for j, b in enumerate(barcodes)}
     use_genes = [i for i, g in enumerate(names) if bool(gene_mask[i]) and str(g).strip()]
 
-    j_idx = [col[c] for c in wanted_ids if c in col]
-    ids = [c for c in wanted_ids if c in col]
+    j_idx = [col[c] for c in cell_id_order if c in col]
+    ids = [c for c in cell_id_order if c in col]
     if not j_idx:
-        return pd.DataFrame({"cell_id": list(wanted_ids)})
+        return pd.DataFrame({"cell_id": list(cell_id_order)})
 
     sub = mat[use_genes, :][:, j_idx]
     d = sub.toarray()
@@ -190,20 +256,20 @@ def _expression_wide_from_h5(
 
 def _expression_wide_from_mex(
     mex_dir: Path,
-    wanted_ids: set[str],
+    cell_id_order: Sequence[str],
 ) -> pd.DataFrame:
     mat, barcodes, names, gene_mask = _read_feature_matrix_mex(mex_dir)
-    return _mat_to_wide_df(mat, barcodes, names, gene_mask, wanted_ids)
+    return _mat_to_wide_df(mat, barcodes, names, gene_mask, cell_id_order)
 
 
-def _mat_to_wide_df(mat, barcodes, names, gene_mask, wanted_ids: set[str]):
+def _mat_to_wide_df(mat, barcodes, names, gene_mask, cell_id_order: Sequence[str]):
     col = {b: j for j, b in enumerate(barcodes)}
     use_genes = [i for i, g in enumerate(names) if bool(gene_mask[i]) and str(g).strip()]
 
-    j_idx = [col[c] for c in wanted_ids if c in col]
-    ids = [c for c in wanted_ids if c in col]
+    j_idx = [col[c] for c in cell_id_order if c in col]
+    ids = [c for c in cell_id_order if c in col]
     if not j_idx:
-        return pd.DataFrame({"cell_id": list(wanted_ids)})
+        return pd.DataFrame({"cell_id": list(cell_id_order)})
 
     sub = mat[use_genes, :][:, j_idx]
     d = sub.toarray()
@@ -280,11 +346,16 @@ def _write_poly_lods(
                 except Exception:
                     pass
             gj = json.dumps(mapping(poly))
+            bx = poly.bounds  # (minx, miny, maxx, maxy)
             rows.append(
                 {
                     "id": f"cell_poly_{cid}",
                     "geometry_json": gj,
                     "cell_id": cid,
+                    "min_x": bx[0],
+                    "min_y": bx[1],
+                    "max_x": bx[2],
+                    "max_y": bx[3],
                 }
             )
         for cid, (cx, cy) in cell_centroids.items():
@@ -299,11 +370,16 @@ def _write_poly_lods(
                     (cx - r, cy + r),
                 ]
             )
+            bx = poly.bounds
             rows.append(
                 {
                     "id": f"cell_poly_{cid}",
                     "geometry_json": json.dumps(mapping(poly)),
                     "cell_id": cid,
+                    "min_x": bx[0],
+                    "min_y": bx[1],
+                    "max_x": bx[2],
+                    "max_y": bx[3],
                 }
             )
         pd.DataFrame(rows).to_parquet(out_dir / f"polygons_lod{lod}.parquet", index=False)
@@ -584,21 +660,8 @@ def _write_he_synthetic(bounds: dict[str, float], out_png: Path, long_edge: int)
     img.save(out_png, format="PNG", optimize=True, compress_level=9)
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--xenium-dir", type=Path, required=True, help="Xenium output region directory")
-    ap.add_argument("--out-dir", type=Path, required=True, help="Output sample folder, e.g. data/xenium_511Tumor_5k")
-    ap.add_argument("--n-cells", type=int, default=5000)
-    ap.add_argument("--seed", type=int, default=42)
-    ap.add_argument("--transcript-max", type=int, default=200_000, help="Max transcript rows in transcripts/0_0_0.parquet")
-    ap.add_argument("--he-long-edge", type=int, default=1600, help="PNG long edge in pixels")
-    ap.add_argument(
-        "--skip-he-morphology",
-        action="store_true",
-        help="Do not try to read OME-TIFF; write a placeholder he.png in cropped bounds only",
-    )
-    args = ap.parse_args()
-
+def run_export(args: argparse.Namespace) -> int:
+    """Shared export logic for subset and full-run CLIs."""
     x = args.xenium_dir.resolve()
     out = args.out_dir.resolve()
     if not x.is_dir():
@@ -608,14 +671,45 @@ def main() -> int:
     (out / "plots").mkdir(exist_ok=True)
     (out / "transcripts").mkdir(exist_ok=True)
 
-    # ---- cells
+    # ---- cells: one ordered ID list for every artifact (avoids set-order + matrix mismatch)
     print("Load cells…")
     cdf = _read_cells(x)
-    n = int(min(args.n_cells, len(cdf)))
-    all_ids = cdf["cell_id"].astype(str).tolist()
-    chosen = set(_sample_ids(all_ids, n, args.seed))
-    sub_cells = cdf[cdf["cell_id"].astype(str).isin(chosen)].copy()
+    pool_ids = list(dict.fromkeys(cdf["cell_id"].astype(str).tolist()))
+    mb = _matrix_barcodes_set(x)
+    if mb is not None and not args.ignore_matrix_barcode_filter:
+        pool = [c for c in pool_ids if c in mb]
+        n_overlap = len(pool)
+        n_cells_tab = len(pool_ids)
+        if n_cells_tab > 0 and n_overlap < n_cells_tab:
+            print(
+                f"Sampling pool: {n_overlap} cells in both cells table and feature matrix "
+                f"(of {n_cells_tab} in table). Use --ignore-matrix-barcode-filter to include others.",
+            )
+        if not pool:
+            print(
+                f"No cell_id in common between cells table and feature matrix under {x}.",
+                file=sys.stderr,
+            )
+            return 1
+    else:
+        pool = pool_ids
+    export_all = bool(getattr(args, "export_all_cells", False))
+    if export_all:
+        chosen_list = list(pool)
+        print(f"Export all cells in pool: {len(chosen_list)} (no random subset).")
+    else:
+        n_take = int(min(int(args.n_cells), len(pool)))
+        chosen_list = _sample_ids(pool, n_take, args.seed)
+    chosen_set = set(chosen_list)
+    order_key = {cid: i for i, cid in enumerate(chosen_list)}
+    sub_cells = cdf[cdf["cell_id"].astype(str).isin(chosen_set)].copy()
+    sub_cells["_ord"] = sub_cells["cell_id"].astype(str).map(lambda s: order_key.get(s, -1))
+    if (sub_cells["_ord"] < 0).any():
+        print("Error: sample IDs missing from cells table (inconsistent data).", file=sys.stderr)
+        return 1
+    sub_cells = sub_cells.sort_values("_ord").drop(columns=["_ord"])
     sub_cells = sub_cells.rename(columns={c: c for c in sub_cells.columns})
+    n = len(chosen_list)
     cells_out = pd.DataFrame(
         {
             "cell_id": sub_cells["cell_id"].astype(str),
@@ -626,22 +720,18 @@ def main() -> int:
     cells_out.to_parquet(out / "cells.parquet", index=False)
     cx_map = {str(r["cell_id"]): (float(r["x"]), float(r["y"])) for _, r in cells_out.iterrows()}
 
-    # ---- feature matrix
-    h5p = _find_file(
-        x,
-        ["cell_feature_matrix.h5", "cell_feature_matrix/cell_feature_matrix.h5"],
-    )
-    h5p = h5p or (x / "cell_feature_matrix" / "cell_feature_matrix.h5")
+    # ---- feature matrix (column order = chosen_list)
+    h5p = _find_feature_matrix_h5(x)
     mex_dir = x / "cell_feature_matrix"
-    if h5p and h5p.exists():
+    if h5p is not None:
         print("Load cell_feature_matrix.h5…")
-        expr = _expression_wide_from_h5(h5p, chosen)
+        expr = _expression_wide_from_h5(h5p, chosen_list)
     elif (mex_dir / "matrix.mtx.gz").exists() or (mex_dir / "matrix.mtx").exists():
         print("Load cell_feature_matrix MEX…")
-        expr = _expression_wide_from_mex(mex_dir, chosen)
+        expr = _expression_wide_from_mex(mex_dir, chosen_list)
     else:
         print("No cell_feature_matrix.h5 or MEX; expression-wide will be cell_id only.", file=sys.stderr)
-        expr = pd.DataFrame({"cell_id": list(chosen)})
+        expr = pd.DataFrame({"cell_id": list(chosen_list)})
 
     order = cells_out["cell_id"].astype(str).tolist()
     expr = cells_out[["cell_id"]].merge(expr, on="cell_id", how="left")
@@ -675,7 +765,7 @@ def main() -> int:
     try:
         print("Build polygons…")
         bdf = _read_boundaries(x)
-        polys = _boundaries_to_polygons(bdf, chosen)
+        polys = _boundaries_to_polygons(bdf, chosen_set)
         _write_poly_lods(polys, cx_map, out)
     except FileNotFoundError as e:
         print(f"Warning: {e}; using square footprints.", file=sys.stderr)
@@ -684,21 +774,21 @@ def main() -> int:
 
     # ---- transcripts
     try:
-        print("Subsample transcripts…")
+        print("Prepare transcript tile…")
         tdf = _read_transcripts(x)
-        tx = _transcripts_to_tile(tdf, chosen, args.transcript_max, args.seed)
+        tx = _transcripts_to_tile(tdf, chosen_set, args.transcript_max, args.seed)
         tx.to_parquet(out / "transcripts" / "0_0_0.parquet", index=False)
     except FileNotFoundError as e:
         print(f"Warning: {e}", file=sys.stderr)
         pd.DataFrame({"x": [], "y": [], "gene_id": []}).to_parquet(out / "transcripts" / "0_0_0.parquet", index=False)
 
     # ---- plots: UMAP + composition
-    pts, ulabel = _load_umap_points(x, list(chosen))
+    pts, ulabel = _load_umap_points(x, chosen_list)
     if not pts:
         print("UMAP: build synthetic projection (or from metadata).")
-        pts, ulabel = _synthetic_umap(list(chosen), None, meta)
-    if not pts and list(chosen):
-        pts, ulabel = _synthetic_umap(list(chosen), None, meta)
+        pts, ulabel = _synthetic_umap(chosen_list, None, meta)
+    if not pts and chosen_list:
+        pts, ulabel = _synthetic_umap(chosen_list, None, meta)
 
     col_for_comp = ulabel
     if col_for_comp and pts and not all(col_for_comp in p for p in pts):
@@ -773,8 +863,12 @@ def main() -> int:
 
     sample = {
         "sample_id": out.name,
-        "title": f"Xenium subset ({n} cells)",
-        "description": f"Subsampled from {x.name} for CSO_SpatialVis",
+        "title": (f"Xenium ({n} cells)" if export_all else f"Xenium subset ({n} cells)"),
+        "description": (
+            f"Exported from {x.name} for CSO_SpatialVis (all cells in pool)"
+            if export_all
+            else f"Subsampled from {x.name} for CSO_SpatialVis"
+        ),
         "coordinate_unit": "microns",
         "bounds": bounds,
         "image": {
@@ -792,6 +886,35 @@ def main() -> int:
     print("Manifest sample (copy into samples[]):")
     print(json.dumps(sample, indent=2))
     return 0
+
+
+def parse_args_subset() -> argparse.Namespace:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--xenium-dir", type=Path, required=True, help="Xenium output region directory")
+    ap.add_argument("--out-dir", type=Path, required=True, help="Output sample folder, e.g. data/xenium_511Tumor_5k")
+    ap.add_argument("--n-cells", type=int, default=5000)
+    ap.add_argument("--seed", type=int, default=42)
+    ap.add_argument("--transcript-max", type=int, default=200_000, help="Max transcript rows in transcripts/0_0_0.parquet")
+    ap.add_argument("--he-long-edge", type=int, default=1600, help="PNG long edge in pixels")
+    ap.add_argument(
+        "--skip-he-morphology",
+        action="store_true",
+        help="Do not try to read OME-TIFF; write a placeholder he.png in cropped bounds only",
+    )
+    ap.add_argument(
+        "--ignore-matrix-barcode-filter",
+        action="store_true",
+        help="Sample from all cells in cells.parquet, even if some IDs are missing from the "
+        "feature matrix (expression shows zeros for missing). Default: when a matrix exists, only "
+        "sample cells present in both the cells table and matrix so rows stay consistent.",
+    )
+    args = ap.parse_args()
+    args.export_all_cells = False
+    return args
+
+
+def main() -> int:
+    return run_export(parse_args_subset())
 
 
 if __name__ == "__main__":

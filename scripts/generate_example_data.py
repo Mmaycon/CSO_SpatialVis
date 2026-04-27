@@ -209,11 +209,16 @@ def main() -> None:
                 except Exception:
                     pass
             gj = mapping(poly)
+            b = poly.bounds
             feats_lod[lod].append(
                 {
                     "id": f"cell_poly_{cid}",
                     "geometry_json": json.dumps(gj),
                     "cell_id": cid,
+                    "min_x": b[0],
+                    "min_y": b[1],
+                    "max_x": b[2],
+                    "max_y": b[3],
                 }
             )
 

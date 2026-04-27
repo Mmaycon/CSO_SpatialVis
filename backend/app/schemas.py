@@ -48,7 +48,10 @@ class PolygonsResponse(BaseModel):
     sample_id: str
     lod: int
     viewport: dict[str, float]
-    features: list[PolygonFeature]
+    total_in_viewport: int = 0
+    returned: int = 0
+    truncated: bool = False
+    features: list[PolygonFeature] = Field(default_factory=list)
 
 
 class TranscriptsResponse(BaseModel):

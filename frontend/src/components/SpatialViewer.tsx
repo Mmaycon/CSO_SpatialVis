@@ -276,6 +276,39 @@ function worldBBoxFromViewState(vs: OrthoViewState, width: number, height: numbe
   };
 }
 
+/**
+ * Outlines are heavy for whole-slide view. We only call /api/polygons when the visible
+ * world rectangle is at most this fraction of the full sample (area ratio). Zoom/pan
+ * so your region of interest covers less of the tissue to load polygons for that area only.
+ */
+const POLYGON_MAX_VIEWPORT_AREA_FRACTION = 0.22;
+
+function isViewportSmallEnoughForPolygons(
+  bbox: { min_x: number; min_y: number; max_x: number; max_y: number },
+  bounds: SampleBounds,
+): boolean {
+  const bw = Math.max(1e-9, bbox.max_x - bbox.min_x);
+  const bh = Math.max(1e-9, bbox.max_y - bbox.min_y);
+  const fullW = Math.max(1e-9, bounds.max_x - bounds.min_x);
+  const fullH = Math.max(1e-9, bounds.max_y - bounds.min_y);
+  const viewArea = bw * bh;
+  const fullArea = fullW * fullH;
+  return viewArea / fullArea <= POLYGON_MAX_VIEWPORT_AREA_FRACTION;
+}
+
+function filterCellsInViewport(
+  cache: ReadonlyMap<string, CellRecord>,
+  bbox: { min_x: number; min_y: number; max_x: number; max_y: number } | null,
+): CellRecord[] {
+  if (!bbox) return [];
+  const { min_x, min_y, max_x, max_y } = bbox;
+  const out: CellRecord[] = [];
+  for (const c of cache.values()) {
+    if (c.x >= min_x && c.x <= max_x && c.y >= min_y && c.y <= max_y) out.push(c);
+  }
+  return out;
+}
+
 export function SpatialViewer(props: Props) {
   const cellRadiusScale = props.cellRadiusScale ?? 1;
   const overlayGenes = props.overlayGenes ?? [];
@@ -287,7 +320,12 @@ export function SpatialViewer(props: Props) {
     initialOrthoForBounds(props.bounds, 800, 600),
   );
 
-  const [cells, setCells] = useState<CellRecord[]>([]);
+  /**
+   * Merged from every /api/cells response for this sample. Zooming/panning filters this to the
+   * current view so zoom-out is instant for regions already seen; new areas still refetch in the background.
+   */
+  const [cellCache, setCellCache] = useState(() => new Map<string, CellRecord>());
+
   const [geojson, setGeojson] = useState<{ type: "FeatureCollection"; features: any[] }>({
     type: "FeatureCollection",
     features: [],
@@ -301,6 +339,20 @@ export function SpatialViewer(props: Props) {
   );
   const dragActive = useRef(false);
   const [polyDraft, setPolyDraft] = useState<[number, number][]>([]);
+  /** Last /api/cells stats so you can confirm viewport loading vs dataset size */
+  const [viewportCellStats, setViewportCellStats] = useState<{
+    totalInViewport: number;
+    truncated: boolean;
+  } | null>(null);
+  /** Last /api/polygons stats (polygons mode only) */
+  const [viewportPolyStats, setViewportPolyStats] = useState<{
+    totalInViewport: number;
+    truncated: boolean;
+  } | null>(null);
+  /** True while /api/cells (and /api/polygons in polygon mode) for the current view are in flight */
+  const [viewportLoading, setViewportLoading] = useState(false);
+  const [viewportLoadError, setViewportLoadError] = useState<string | null>(null);
+  const viewportFetchGen = useRef(0);
   const lodRef = useRef(2);
 
   useEffect(() => {
@@ -339,18 +391,61 @@ export function SpatialViewer(props: Props) {
 
   const debouncedReload = useDebouncedCallback(
     async (bbox: { min_x: number; min_y: number; max_x: number; max_y: number }) => {
-      const [cRes, pRes] = await Promise.all([
-        api.fetchCells(props.sampleId, bbox),
-        api.fetchPolygons(props.sampleId, lodRef.current, bbox),
-      ]);
-      setCells(cRes.cells);
-      const feats = (pRes.features ?? []).map((f: { id: string; geometry: any; properties: any }) => ({
-        type: "Feature" as const,
-        id: f.id,
-        geometry: f.geometry,
-        properties: f.properties ?? {},
-      }));
-      setGeojson({ type: "FeatureCollection", features: feats });
+      const gen = ++viewportFetchGen.current;
+      setViewportLoading(true);
+      setViewportLoadError(null);
+      try {
+        const cRes = await api.fetchCells(props.sampleId, bbox);
+        if (gen !== viewportFetchGen.current) return;
+        setCellCache((prev) => {
+          const n = new Map(prev);
+          for (const c of cRes.cells) {
+            n.set(c.cell_id, c);
+          }
+          return n;
+        });
+        setViewportCellStats({
+          totalInViewport: cRes.total_in_viewport,
+          truncated: Boolean(cRes.truncated),
+        });
+
+        const polyAreaOk = isViewportSmallEnoughForPolygons(bbox, props.bounds);
+        if (props.showPolygons && polyAreaOk) {
+          const pRes = (await api.fetchPolygons(props.sampleId, lodRef.current, bbox)) as {
+            features?: unknown[];
+            total_in_viewport?: number;
+            truncated?: boolean;
+          };
+          if (gen !== viewportFetchGen.current) return;
+          const rawFeats = pRes.features ?? [];
+          const feats = rawFeats.map((f) => {
+            const x = f as { id: string; geometry: any; properties: any };
+            return {
+              type: "Feature" as const,
+              id: x.id,
+              geometry: x.geometry,
+              properties: x.properties ?? {},
+            };
+          });
+          setGeojson({ type: "FeatureCollection", features: feats });
+          setViewportPolyStats({
+            totalInViewport: Number(pRes.total_in_viewport ?? feats.length),
+            truncated: Boolean(pRes.truncated),
+          });
+        } else {
+          setGeojson({ type: "FeatureCollection", features: [] });
+          setViewportPolyStats(null);
+        }
+      } catch (e) {
+        if (gen !== viewportFetchGen.current) return;
+        setViewportLoadError(e instanceof Error ? e.message : String(e));
+        setViewportCellStats(null);
+        setViewportPolyStats(null);
+      } finally {
+        if (gen === viewportFetchGen.current) {
+          setViewportLoading(false);
+        }
+      }
     },
     140,
   );
@@ -361,7 +456,25 @@ export function SpatialViewer(props: Props) {
     const z = viewState.ortho.zoom;
     lodRef.current = z > 6 ? 0 : z > 3 ? 1 : 2;
     debouncedReload(bbox);
-  }, [debouncedReload, props.sampleId, size.h, size.w, viewState]);
+  }, [debouncedReload, props.bounds, props.sampleId, props.showPolygons, size.h, size.w, viewState]);
+
+  const viewportBBoxForPolyHint = useMemo(
+    () => safeWorldBBoxFromViewState(viewState, size.w, size.h),
+    [viewState, size.w, size.h],
+  );
+  const polygonLoadAllowed = useMemo(() => {
+    if (!viewportBBoxForPolyHint) return false;
+    return isViewportSmallEnoughForPolygons(viewportBBoxForPolyHint, props.bounds);
+  }, [viewportBBoxForPolyHint, props.bounds]);
+
+  const visibleCells = useMemo(
+    () => filterCellsInViewport(cellCache, viewportBBoxForPolyHint),
+    [cellCache, viewportBBoxForPolyHint],
+  );
+
+  useEffect(() => {
+    setCellCache(new Map());
+  }, [props.dataRevision, props.sampleId]);
 
   useEffect(() => {
     reloadViewport();
@@ -371,17 +484,18 @@ export function SpatialViewer(props: Props) {
     reloadViewport();
   }, [props.dataRevision, reloadViewport]);
 
+  /* Load full gene columns once per gene (not per viewport). Expression maps are by cell_id;
+   * the scatter layer uses cached cells in the current view. */
   useEffect(() => {
-    if (!overlayGenes.length || !cells.length) {
+    if (!overlayGenes.length) {
       setOverlayMaps({});
       return;
     }
     let cancelled = false;
-    const ids = cells.map((c) => c.cell_id);
     void (async () => {
       const entries = await Promise.all(
         overlayGenes.map(async (g) => {
-          const res = await api.fetchGeneExpression(props.sampleId, g, ids);
+          const res = await api.fetchGeneExpression(props.sampleId, g);
           return [g, res.values ?? {}] as const;
         }),
       );
@@ -393,27 +507,35 @@ export function SpatialViewer(props: Props) {
     return () => {
       cancelled = true;
     };
-  }, [cells, overlayGenes, props.sampleId]);
+  }, [overlayGenes, props.sampleId]);
 
   useEffect(() => {
-    const run = async () => {
-      if (props.paintMode !== "gene") {
-        setGeneMap({});
-        return;
-      }
-      const ids = cells.map((c) => c.cell_id);
-      if (!ids.length || !props.gene) {
-        setGeneMap({});
-        return;
-      }
-      const res = await api.fetchGeneExpression(props.sampleId, props.gene, ids);
+    if (props.paintMode !== "gene") {
+      setGeneMap({});
+      return;
+    }
+    if (!props.gene) {
+      setGeneMap({});
+      return;
+    }
+    let cancelled = false;
+    void (async () => {
+      const res = await api.fetchGeneExpression(props.sampleId, props.gene);
+      if (cancelled) return;
       setGeneMap(res.values ?? {});
+    })();
+    return () => {
+      cancelled = true;
     };
-    void run();
-  }, [cells, props.paintMode, props.gene, props.sampleId]);
+  }, [props.paintMode, props.gene, props.sampleId]);
 
+  /** Viridis range from the current viewport only (contrast); values still come from full column. */
   const exprRange = useMemo(() => {
-    const vals = Object.values(geneMap);
+    const vals: number[] = [];
+    for (const c of visibleCells) {
+      const v = geneMap[c.cell_id];
+      if (typeof v === "number" && Number.isFinite(v)) vals.push(v);
+    }
     if (!vals.length) return { vmin: 0, vmax: 1 };
     let vmin = Infinity;
     let vmax = -Infinity;
@@ -421,13 +543,21 @@ export function SpatialViewer(props: Props) {
       vmin = Math.min(vmin, v);
       vmax = Math.max(vmax, v);
     }
+    if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
+      return { vmin: vmin, vmax: vmin + 1e-9 };
+    }
     return { vmin, vmax };
-  }, [geneMap]);
+  }, [geneMap, visibleCells]);
 
   const overlayRanges = useMemo(() => {
     const out: Record<string, { vmin: number; vmax: number }> = {};
     for (const g of overlayGenes) {
-      const vals = Object.values(overlayMaps[g] ?? {});
+      const m = overlayMaps[g] ?? {};
+      const vals: number[] = [];
+      for (const c of visibleCells) {
+        const v = m[c.cell_id];
+        if (typeof v === "number" && Number.isFinite(v)) vals.push(v);
+      }
       if (!vals.length) {
         out[g] = { vmin: 0, vmax: 1 };
         continue;
@@ -438,12 +568,16 @@ export function SpatialViewer(props: Props) {
         vmin = Math.min(vmin, v);
         vmax = Math.max(vmax, v);
       }
-      out[g] = { vmin, vmax };
+      if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
+        out[g] = { vmin, vmax: vmin + 1e-9 };
+      } else {
+        out[g] = { vmin, vmax };
+      }
     }
     return out;
-  }, [overlayGenes, overlayMaps]);
+  }, [overlayGenes, overlayMaps, visibleCells]);
 
-  const cellById = useMemo(() => new Map(cells.map((c) => [c.cell_id, c])), [cells]);
+  const cellById = useMemo(() => new Map([...cellCache.values()].map((c) => [c.cell_id, c])), [cellCache]);
 
   const scaledGeojson = useMemo(
     () => scaleFeatureCollectionAboutCenters(geojson, cellById, cellRadiusScale),
@@ -554,14 +688,14 @@ export function SpatialViewer(props: Props) {
       }
     }
 
-    if (props.showCentroids && cells.length) {
+    if (props.showCentroids && visibleCells.length) {
       const baseR = Math.max(1.1, Math.min(5, 1.7 + zoom * 0.12));
       const rPix = Math.max(0.5, baseR * cellRadiusScale);
       const baseAlpha = overlayActive ? props.centroidOpacity * 0.25 : props.centroidOpacity;
       ls.push(
         new ScatterplotLayer({
           id: "cells",
-          data: cells,
+          data: visibleCells,
           coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
           getPosition: (d: CellRecord) => [d.x, d.y, 0],
           getRadius: rPix,
@@ -598,7 +732,7 @@ export function SpatialViewer(props: Props) {
               vmin,
               vmax,
               overlayActive,
-              cells,
+              visibleCells,
             ],
             getRadius: [zoom, cellRadiusScale],
           },
@@ -606,14 +740,14 @@ export function SpatialViewer(props: Props) {
       );
     }
 
-    if (props.showCentroids && cells.length && overlayActive) {
+    if (props.showCentroids && visibleCells.length && overlayActive) {
       const baseR = Math.max(1.1, Math.min(5, 1.7 + zoom * 0.12));
       const rPix = Math.max(0.5, baseR * cellRadiusScale);
       const og = overlayGenes;
       ls.push(
         new ScatterplotLayer({
           id: "cells-overlay-genes",
-          data: cells,
+          data: visibleCells,
           coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
           getPosition: (d: CellRecord) => [d.x, d.y, 0],
           getRadius: rPix,
@@ -653,7 +787,7 @@ export function SpatialViewer(props: Props) {
 
     return ls as any;
   }, [
-    cells,
+    visibleCells,
     exprRange,
     geneMap,
     scaledGeojson,
@@ -736,7 +870,7 @@ export function SpatialViewer(props: Props) {
         min_y: Math.min(c0[1], c1[1]),
         max_y: Math.max(c0[1], c1[1]),
       };
-      const picked = cells
+      const picked = visibleCells
         .filter((c) => c.x >= box.min_x && c.x <= box.max_x && c.y >= box.min_y && c.y <= box.max_y)
         .map((c) => c.cell_id);
       props.onToggleSelected(picked, !e.shiftKey);
@@ -858,7 +992,53 @@ export function SpatialViewer(props: Props) {
         }}
       >
         <div style={{ opacity: 0.85 }}>
-          Cells loaded: {cells.length} · LOD: {lodRef.current}
+          {viewportLoading ? (
+            <span style={{ color: "#a8d4ff" }}>
+              {props.showPolygons && polygonLoadAllowed
+                ? "Loading cells & cell outlines…"
+                : "Loading cells…"}{" "}
+              <span style={{ opacity: 0.75 }}>(the API caches data after the first read in each process)</span>
+            </span>
+          ) : null}
+          {viewportLoadError ? (
+            <span style={{ color: "#ff9090", display: "block", marginBottom: 6 }}>
+              Load failed: {viewportLoadError}
+            </span>
+          ) : null}
+          {!viewportLoading && props.showPolygons && !polygonLoadAllowed ? (
+            <div style={{ color: "#ffb070", marginBottom: 6, lineHeight: 1.45 }}>
+              Cell outlines: zoom in so the visible area is a smaller part of the slide (≤
+              {Math.round(POLYGON_MAX_VIEWPORT_AREA_FRACTION * 100)}% of sample area). Only that region
+              then loads outlines — full overview stays fast.
+            </div>
+          ) : null}
+          {!viewportLoading ? (
+            <>
+              Cells drawn: {visibleCells.length}
+              {cellCache.size > 0 ? (
+                <span style={{ opacity: 0.7 }}> · {cellCache.size.toLocaleString()} unique in memory (pan/zoom reuses; new areas still fetch)</span>
+              ) : null}
+              {viewportCellStats != null ? (
+                <>
+                  {" "}
+                  · {viewportCellStats.totalInViewport.toLocaleString()} in view rectangle
+                  {viewportCellStats.truncated ? (
+                    <span style={{ color: "#ffb070" }}> · cells capped (CSO_MAX_CELLS_PER_VIEWPORT)</span>
+                  ) : null}
+                </>
+              ) : null}
+              {props.showPolygons && viewportPolyStats != null ? (
+                <>
+                  {" "}
+                  · {viewportPolyStats.totalInViewport.toLocaleString()} outlines in view
+                  {viewportPolyStats.truncated ? (
+                    <span style={{ color: "#ffb070" }}> · outlines capped (CSO_MAX_POLYGONS_PER_VIEWPORT)</span>
+                  ) : null}
+                </>
+              ) : null}{" "}
+              · LOD: {lodRef.current}
+            </>
+          ) : null}
           {hoverCell ? (
             <>
               {" · "}

@@ -13,6 +13,7 @@ export async function fetchCells(
   cells: CellRecord[];
   truncated: boolean;
   total_in_viewport: number;
+  returned: number;
 }> {
   const u = new URL("/api/cells", window.location.href);
   u.searchParams.set("sample_id", sampleId);
@@ -79,11 +80,18 @@ export async function fetchGenes(sampleId: string): Promise<{ sample_id: string;
   return r.json();
 }
 
-export async function fetchGeneExpression(sampleId: string, gene: string, cellIds: string[]) {
+/** Full sample column if `cellIds` omitted; subset when a non-empty list is passed. */
+export async function fetchGeneExpression(
+  sampleId: string,
+  gene: string,
+  cellIds?: string[],
+): Promise<{ values: Record<string, number> }> {
   const u = new URL("/api/gene_expression", window.location.href);
   u.searchParams.set("sample_id", sampleId);
   u.searchParams.set("gene", gene);
-  if (cellIds.length) u.searchParams.set("cell_ids", cellIds.join(","));
+  if (cellIds !== undefined && cellIds.length > 0) {
+    u.searchParams.set("cell_ids", cellIds.join(","));
+  }
   const r = await fetch(u.toString());
   if (!r.ok) throw new Error(`gene ${r.status}`);
   return r.json() as Promise<{ values: Record<string, number> }>;

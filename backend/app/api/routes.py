@@ -50,6 +50,30 @@ from app.schemas import (
 
 router = APIRouter()
 
+# SQLite (and some drivers) cap SQL bind parameters per query (often 999). Batch large IN lists.
+_IN_CHUNK = 500
+
+
+def _db_roi_tags_for_sample_cells(db: Session, sample_id: str, cids: list[str]) -> dict[str, dict[str, object]]:
+    """All ROI tag rows in DB for the given (sample, cell_id) pairs."""
+    if not cids:
+        return {}
+    out: dict[str, dict] = {}
+    for i in range(0, len(cids), _IN_CHUNK):
+        part = cids[i : i + _IN_CHUNK]
+        for t in (
+            db.query(CellRegionTagRow)
+            .filter(CellRegionTagRow.sample_id == sample_id)
+            .filter(CellRegionTagRow.cell_id.in_(part))
+            .all()
+        ):
+            out[t.cell_id] = {
+                "pathology_region": t.pathology_region,
+                "pathology_region_source": t.pathology_region_source,
+                "pathology_region_confidence": t.pathology_region_confidence,
+            }
+    return out
+
 
 def _merge_roi_tags_for_cells(
     db: Session,
@@ -112,23 +136,7 @@ def cells(
 
     cids = [r["cell_id"] for r in rows]
     pathology_overlay = overlay_pathology_metadata(sample_id, cids)
-
-    # Merge ROI-derived tags from DB (latest annotation wins per cell for demo)
-    tags_q = []
-    if cids:
-        tags_q = (
-            db.query(CellRegionTagRow)
-            .filter(CellRegionTagRow.sample_id == sample_id)
-            .filter(CellRegionTagRow.cell_id.in_(cids))
-            .all()
-        )
-    db_tags: dict[str, dict] = {}
-    for t in tags_q:
-        db_tags[t.cell_id] = {
-            "pathology_region": t.pathology_region,
-            "pathology_region_source": t.pathology_region_source,
-            "pathology_region_confidence": t.pathology_region_confidence,
-        }
+    db_tags = _db_roi_tags_for_sample_cells(db, sample_id, cids)
 
     cells_out: list[CellRecord] = []
     for r in rows:
@@ -157,11 +165,16 @@ def polygons(
     max_x: float = Query(...),
     max_y: float = Query(...),
 ):
-    feats = read_polygons_viewport(sample_id, lod, min_x, min_y, max_x, max_y)
+    feats, poly_total, poly_truncated = read_polygons_viewport(
+        sample_id, lod, min_x, min_y, max_x, max_y, settings.max_polygons_per_viewport
+    )
     return PolygonsResponse(
         sample_id=sample_id,
         lod=lod,
         viewport={"min_x": min_x, "min_y": min_y, "max_x": max_x, "max_y": max_y},
+        total_in_viewport=poly_total,
+        returned=len(feats),
+        truncated=poly_truncated,
         features=[PolygonFeature(**f) for f in feats],
     )
 
