@@ -87,6 +87,79 @@ export function colorForPathology(region: unknown): [number, number, number, num
   return [r, g, b, 220];
 }
 
+/** How to set viridis endpoints from values in the current view (gene / numeric metadata / overlays). */
+export type ContinuousScaleMode = "full" | "p01_p99" | "p05_p95";
+
+export function continuousScaleModeLabel(mode: ContinuousScaleMode): string {
+  switch (mode) {
+    case "p01_p99":
+      return "1–99th percentile";
+    case "p05_p95":
+      return "5–95th percentile";
+    default:
+      return "min–max";
+  }
+}
+
+/**
+ * vmin/vmax for continuous coloring. Percentile modes use linear interpolation on sorted viewport values
+ * (robust to outliers); falls back to full min–max if the range collapses.
+ */
+export function valueRangeForContinuousScale(vals: number[], mode: ContinuousScaleMode): { vmin: number; vmax: number } {
+  const finite = vals.filter((v): v is number => typeof v === "number" && Number.isFinite(v));
+  if (!finite.length) return { vmin: 0, vmax: 1 };
+
+  if (mode === "full") {
+    let vmin = Infinity;
+    let vmax = -Infinity;
+    for (const v of finite) {
+      vmin = Math.min(vmin, v);
+      vmax = Math.max(vmax, v);
+    }
+    if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
+      return { vmin, vmax: vmin + 1e-9 };
+    }
+    return { vmin, vmax };
+  }
+
+  const sorted = [...finite].sort((a, b) => a - b);
+  const n = sorted.length;
+
+  const quantile = (pPercent: number): number => {
+    if (n === 1) return sorted[0]!;
+    const p = Math.min(100, Math.max(0, pPercent)) / 100;
+    const idx = p * (n - 1);
+    const lo = Math.floor(idx);
+    const hi = Math.ceil(idx);
+    const t = idx - lo;
+    if (lo >= hi) return sorted[lo]!;
+    return sorted[lo]! * (1 - t) + sorted[hi]! * t;
+  };
+
+  const lowP = mode === "p01_p99" ? 1 : 5;
+  const highP = mode === "p01_p99" ? 99 : 95;
+  const vmin = quantile(lowP);
+  const vmax = quantile(highP);
+  if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
+    return valueRangeForContinuousScale(vals, "full");
+  }
+  return { vmin, vmax };
+}
+
+/** Parse a metadata cell value for continuous (viridis) coloring. */
+export function parseMetadataNumeric(value: unknown): number | null {
+  if (value === null || value === undefined) return null;
+  if (typeof value === "number" && Number.isFinite(value)) return value;
+  if (typeof value === "boolean") return value ? 1 : 0;
+  if (typeof value === "string") {
+    const t = value.trim();
+    if (!t) return null;
+    const n = Number(t);
+    if (Number.isFinite(n)) return n;
+  }
+  return null;
+}
+
 export function colorFromExpression(v: number, vmin: number, vmax: number): [number, number, number, number] {
   if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
     return [80, 80, 90, 200];

@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 function useMutuallyExclusivePair(
   initialA: boolean,
@@ -26,7 +26,22 @@ import * as api from "@/api";
 import { OverlayGeneExpression } from "@/components/OverlayGeneExpression";
 import { SpatialViewer, type InteractionMode } from "@/components/SpatialViewer";
 import { UmapPanel, type UmapPoint } from "@/components/UmapPanel";
+import type { ContinuousScaleMode } from "@/colors";
 import type { Manifest, SampleBounds, SampleRef } from "@/types";
+import { parseMorphologyFrame } from "@/types";
+import { useDebouncedCallback } from "@/hooks/useDebouncedCallback";
+
+function parseImageTranslateUm(img: unknown): [number, number] {
+  if (!img || typeof img !== "object") return [0, 0];
+  const al = (img as Record<string, unknown>).alignment;
+  if (!al || typeof al !== "object") return [0, 0];
+  const tu = (al as Record<string, unknown>).translate_um;
+  if (!Array.isArray(tu) || tu.length !== 2) return [0, 0];
+  const dx = Number(tu[0]);
+  const dy = Number(tu[1]);
+  if (!Number.isFinite(dx) || !Number.isFinite(dy)) return [0, 0];
+  return [dx, dy];
+}
 
 export function App() {
   const [manifest, setManifest] = useState<Manifest | null>(null);
@@ -45,6 +60,8 @@ export function App() {
   const [paintMode, setPaintMode] = useState<"metadata" | "gene">("metadata");
   const [metadataColumn, setMetadataColumn] = useState("cell_type");
   const [metadataColumns, setMetadataColumns] = useState<string[]>(["cell_type"]);
+  const [metadataColumnKinds, setMetadataColumnKinds] = useState<Record<string, "numeric" | "categorical">>({});
+  const [continuousScaleMode, setContinuousScaleMode] = useState<ContinuousScaleMode>("full");
   const [gene, setGene] = useState("EPCAM");
   const [geneFilter, setGeneFilter] = useState("");
   const [availableGenes, setAvailableGenes] = useState<string[]>([]);
@@ -58,9 +75,6 @@ export function App() {
   const [selectedIds, setSelectedIds] = useState<Set<string>>(new Set());
 
   const [umapPoints, setUmapPoints] = useState<UmapPoint[]>([]);
-
-  const [draftPoly, setDraftPoly] = useState<[number, number][] | null>(null);
-  const [pendingRing, setPendingRing] = useState<[number, number][] | null>(null);
 
   const [annoLabel, setAnnoLabel] = useState("necrosis");
   const [annoAuthor, setAnnoAuthor] = useState("pathologist.demo");
@@ -114,9 +128,16 @@ export function App() {
           ? prev
           : (c.metadata_columns[0] ?? "cell_type"),
       );
+      const rawKinds = c.metadata_column_kinds ?? {};
+      const kinds: Record<string, "numeric" | "categorical"> = {};
+      for (const [k, v] of Object.entries(rawKinds)) {
+        kinds[k] = v === "numeric" ? "numeric" : "categorical";
+      }
+      setMetadataColumnKinds(kinds);
     } catch {
       setMetadataColumns(["cell_type"]);
       setAvailableGenes([]);
+      setMetadataColumnKinds({});
     }
   }, []);
 
@@ -126,12 +147,153 @@ export function App() {
 
   const samples = manifest?.samples ?? [];
 
+  const morphChannels = useMemo(() => {
+    const s = samples.find((x) => x.sample_id === sampleId);
+    const img = s?.image;
+    if (!img || typeof img !== "object") return [];
+    const raw = (img as Record<string, unknown>).channels;
+    if (!Array.isArray(raw)) return [];
+    const out: { id: string; label: string; url: string; default_visible?: boolean }[] = [];
+    for (const x of raw) {
+      if (!x || typeof x !== "object") continue;
+      const o = x as Record<string, unknown>;
+      const id = o.id;
+      const url = o.url;
+      if (typeof id !== "string" || typeof url !== "string") continue;
+      const label = typeof o.label === "string" ? o.label : id;
+      out.push({
+        id,
+        label,
+        url,
+        default_visible: typeof o.default_visible === "boolean" ? o.default_visible : undefined,
+      });
+    }
+    return out;
+  }, [samples, sampleId]);
+
+  const morphologyFrame = useMemo(() => {
+    const s = samples.find((x) => x.sample_id === sampleId);
+    const img = s?.image;
+    if (!img || typeof img !== "object") return null;
+    return parseMorphologyFrame((img as Record<string, unknown>).morphology_frame);
+  }, [samples, sampleId]);
+
+  const morphologyMicronExtent = useMemo(() => morphologyFrame?.crop_microns ?? null, [morphologyFrame]);
+
+  const registrationMeta = useMemo(() => {
+    const s = samples.find((x) => x.sample_id === sampleId);
+    const img = s?.image;
+    if (!img || typeof img !== "object") return { channelId: null as string | null, referenceUrl: null as string | null };
+    const o = img as Record<string, unknown>;
+    return {
+      channelId: typeof o.registration_channel_id === "string" ? o.registration_channel_id : null,
+      referenceUrl: typeof o.registration_reference_url === "string" ? o.registration_reference_url : null,
+    };
+  }, [samples, sampleId]);
+
+  const [registrationChannelId, setRegistrationChannelId] = useState<string>("");
+
+  useEffect(() => {
+    if (!morphChannels.length) {
+      setRegistrationChannelId("");
+      return;
+    }
+    const exported = registrationMeta.channelId;
+    const matchExported = exported && morphChannels.some((c) => c.id === exported);
+    const want =
+      (matchExported ? exported : null) ??
+      morphChannels.find((c) => c.label.toLowerCase().includes("dapi"))?.id ??
+      morphChannels[0]!.id;
+    setRegistrationChannelId(want);
+  }, [sampleId, morphChannels, registrationMeta.channelId]);
+
+  /** Single reference plane for the Morphology underlay (registration channel picker). */
+  const morphologyChannelsSingle = useMemo(() => {
+    if (!morphChannels.length) return [];
+    const rid = registrationChannelId || morphChannels[0]!.id;
+    const c = morphChannels.find((x) => x.id === rid);
+    return c ? [c] : [morphChannels[0]!];
+  }, [morphChannels, registrationChannelId]);
+
+  /** All OME-derived segmentation PNGs (2+ channels) — separate Multi-channel overlay, not blended into Morphology. */
+  const multiChannelAvailable = morphChannels.length >= 2;
+
+  const [showMultiChannel, setShowMultiChannel] = useState(false);
+  const [multiChannelOpacity, setMultiChannelOpacity] = useState(0.78);
+  const [multiChannelEnabled, setMultiChannelEnabled] = useState<Record<string, boolean>>({});
+
+  useEffect(() => {
+    const init: Record<string, boolean> = {};
+    for (const c of morphChannels) {
+      init[String(c.id)] = c.default_visible !== false;
+    }
+    setMultiChannelEnabled(init);
+  }, [sampleId, morphChannels]);
+
+  const toggleMultiChannel = useCallback((id: string) => {
+    setMultiChannelEnabled((prev) => {
+      const c = morphChannels.find((x) => x.id === id);
+      const base = c?.default_visible !== false;
+      const cur = prev[id] ?? base;
+      return { ...prev, [id]: !cur };
+    });
+  }, [morphChannels]);
+
+  const morphologyFlipY = useMemo(() => {
+    const s = samples.find((x) => x.sample_id === sampleId);
+    const img = s?.image;
+    if (!img || typeof img !== "object") return false;
+    const al = (img as Record<string, unknown>).alignment;
+    if (!al || typeof al !== "object") return false;
+    return (al as Record<string, unknown>).flip_y === true;
+  }, [samples, sampleId]);
+
+  const sampleIdRef = useRef(sampleId);
+  sampleIdRef.current = sampleId;
+
+  const [morphTranslateUm, setMorphTranslateUm] = useState<[number, number]>([0, 0]);
+  const [morphShiftError, setMorphShiftError] = useState<string | null>(null);
+
+  useEffect(() => {
+    const s = samples.find((x) => x.sample_id === sampleId);
+    setMorphTranslateUm(parseImageTranslateUm(s?.image ?? null));
+    setMorphShiftError(null);
+  }, [samples, sampleId]);
+
+  const persistMorphShift = useCallback(async (sid: string, dx: number, dy: number) => {
+    try {
+      const m = await api.patchSampleImageTranslate(sid, { translate_um: [dx, dy] });
+      if (sid !== sampleIdRef.current) return;
+      setManifest(m);
+      setMorphShiftError(null);
+    } catch (e) {
+      if (sid !== sampleIdRef.current) return;
+      setMorphShiftError(e instanceof Error ? e.message : String(e));
+    }
+  }, []);
+
+  const debouncedPersistMorphShift = useDebouncedCallback(persistMorphShift, 450);
+
+  const updateMorphShift = useCallback(
+    (dx: number, dy: number) => {
+      setMorphTranslateUm([dx, dy]);
+      debouncedPersistMorphShift(sampleId, dx, dy);
+    },
+    [sampleId, debouncedPersistMorphShift],
+  );
+
   const filteredGenes = useMemo(() => {
     const q = geneFilter.trim().toLowerCase();
     const base = availableGenes.length ? availableGenes : [gene];
     if (!q) return base;
     return base.filter((g) => g.toLowerCase().includes(q));
   }, [availableGenes, gene, geneFilter]);
+
+  const metadataColumnKind = useMemo(
+    (): "numeric" | "categorical" =>
+      metadataColumnKinds[metadataColumn] === "numeric" ? "numeric" : "categorical",
+    [metadataColumnKinds, metadataColumn],
+  );
 
   const onToggleSelected = useCallback((ids: string[], replace: boolean) => {
     setSelectedIds((prev) => {
@@ -150,62 +312,37 @@ export function App() {
   }, []);
 
   const refreshColumnsAfterRoi = useCallback(
-    async (labelForManualCol: string) => {
+    async (trimmedLabel: string) => {
       try {
         const c = await api.fetchColorColumns(sampleId);
         setMetadataColumns(c.metadata_columns.length ? c.metadata_columns : ["cell_type"]);
         setAvailableGenes(c.genes ?? []);
-        const manualCol = `$ManualAnno:${labelForManualCol.trim()}`;
+        const rawKinds = c.metadata_column_kinds ?? {};
+        const kinds: Record<string, "numeric" | "categorical"> = {};
+        for (const [k, v] of Object.entries(rawKinds)) {
+          kinds[k] = v === "numeric" ? "numeric" : "categorical";
+        }
+        setMetadataColumnKinds(kinds);
+        const manualCol = `$ManualAnno:${trimmedLabel}`;
         if (c.metadata_columns.includes(manualCol)) {
           setMetadataColumn(manualCol);
           setPaintMode("metadata");
         }
       } catch {
-        /* ignore */
+        /* ignore — column list / genes refresh failed (network or API); coloring dropdown may be stale */
       }
     },
     [sampleId],
   );
 
-  const submitAnnotation = async () => {
-    if (!pendingRing || pendingRing.length < 4) {
-      setAnnoStatus("Close a polygon first (polygon mode → vertices → Enter).");
+  const submitSelectionAnnotation = async () => {
+    const labelTrimmed = annoLabel.trim();
+    if (!labelTrimmed) {
+      setAnnoStatus("Enter a non-empty label before saving.");
       return;
     }
-    setAnnoStatus("Saving…");
-    setRoiSaveBanner(null);
-    try {
-      const geometry: GeoJSON.Polygon = {
-        type: "Polygon",
-        coordinates: [pendingRing.map(([x, y]) => [x, y])],
-      };
-      const res = await api.postAnnotation({
-        sample_id: sampleId,
-        label: annoLabel,
-        author: annoAuthor,
-        notes: annoNotes,
-        geometry,
-        confidence: 1.0,
-      });
-      const manualCol = `$ManualAnno:${annoLabel.trim()}`;
-      const n = res.cells_assigned ?? 0;
-      setAnnoStatus(`Done — ${n} cells tagged.`);
-      setRoiSaveBanner(
-        `ROI saved successfully. ${n} cells assigned to label "${res.label}". ` +
-          `Column "${manualCol}" was written to cell_metadata.parquet on the server.`,
-      );
-      setPendingRing(null);
-      setDataRevision((k) => k + 1);
-      await refreshColumnsAfterRoi(annoLabel);
-    } catch (e) {
-      setAnnoStatus(e instanceof Error ? e.message : String(e));
-      setRoiSaveBanner(null);
-    }
-  };
-
-  const submitSelectionAnnotation = async () => {
     if (selectedIds.size === 0) {
-      setAnnoStatus("Select cells first (rectangle mode, or pick on UMAP), then save.");
+      setAnnoStatus("Select cells first (rectangle or lasso mode, or pick on UMAP), then save.");
       return;
     }
     setAnnoStatus("Saving…");
@@ -213,20 +350,20 @@ export function App() {
     try {
       const res = await api.postAnnotationByCells({
         sample_id: sampleId,
-        label: annoLabel,
+        label: labelTrimmed,
         author: annoAuthor,
         notes: annoNotes,
         cell_ids: [...selectedIds],
         confidence: 1.0,
       });
-      const manualCol = `$ManualAnno:${annoLabel.trim()}`;
+      const manualCol = `$ManualAnno:${labelTrimmed}`;
       const n = res.cells_assigned ?? 0;
       setAnnoStatus(`Done — ${n} cells tagged.`);
       setRoiSaveBanner(
-        `Selection saved. ${n} cells assigned to "${res.label}". Column "${manualCol}" in cell_metadata.parquet.`,
+        `Annotation saved. ${n} cells assigned to "${res.label}". Column "${manualCol}" in cell_metadata.parquet.`,
       );
       setDataRevision((k) => k + 1);
-      await refreshColumnsAfterRoi(annoLabel);
+      void refreshColumnsAfterRoi(labelTrimmed);
     } catch (e) {
       setAnnoStatus(e instanceof Error ? e.message : String(e));
       setRoiSaveBanner(null);
@@ -285,6 +422,18 @@ export function App() {
             setGeneFilter("");
             setOverlayGenes([]);
           }}
+          morphChannels={morphChannels}
+          multiChannelAvailable={multiChannelAvailable}
+          showMultiChannel={showMultiChannel}
+          setShowMultiChannel={setShowMultiChannel}
+          multiChannelOpacity={multiChannelOpacity}
+          setMultiChannelOpacity={setMultiChannelOpacity}
+          multiChannelEnabled={multiChannelEnabled}
+          toggleMultiChannel={toggleMultiChannel}
+          registrationChannelId={registrationChannelId}
+          setRegistrationChannelId={setRegistrationChannelId}
+          registrationExportChannelId={registrationMeta.channelId}
+          registrationReferenceUrl={registrationMeta.referenceUrl}
           mode={mode}
           onMode={setMode}
           showCentroids={showCentroids}
@@ -304,6 +453,10 @@ export function App() {
           metadataColumn={metadataColumn}
           setMetadataColumn={setMetadataColumn}
           metadataColumns={metadataColumns}
+          metadataColumnKinds={metadataColumnKinds}
+          continuousScaleMode={continuousScaleMode}
+          setContinuousScaleMode={setContinuousScaleMode}
+          overlayGeneCount={overlayGenes.length}
           gene={gene}
           setGene={setGene}
           geneFilter={geneFilter}
@@ -314,6 +467,9 @@ export function App() {
           defaultCellRadiusScale={DEFAULT_CELL_RADIUS}
           selectedCount={selectedIds.size}
           onClearSelection={() => setSelectedIds(new Set())}
+          morphTranslateUm={morphTranslateUm}
+          onMorphShiftChange={updateMorphShift}
+          morphShiftError={morphShiftError}
         />
         <div style={{ position: "relative", minHeight: 0 }}>
           <SpatialViewer
@@ -329,15 +485,23 @@ export function App() {
             polygonOpacity={polygonOpacity}
             paintMode={paintMode}
             metadataColumn={metadataColumn}
+            metadataColumnKind={metadataColumnKind}
+            continuousScaleMode={continuousScaleMode}
             gene={gene}
             selectedIds={selectedIds}
             onToggleSelected={onToggleSelected}
-            onDraftPolygon={(ring) => setDraftPoly(ring)}
-            onPolygonClosed={(ring) => setPendingRing(ring)}
             cellRadiusScale={cellRadiusScale}
             overlayGenes={overlayGenes}
             overlayOpacity={overlayOpacity}
             dataRevision={dataRevision}
+            morphologyChannels={morphChannels.length ? morphologyChannelsSingle : undefined}
+            showMultiChannel={showMultiChannel}
+            multiChannelChannels={multiChannelAvailable ? morphChannels : undefined}
+            multiChannelEnabled={multiChannelEnabled}
+            multiChannelOpacity={multiChannelOpacity}
+            morphologyFlipY={morphologyFlipY}
+            morphologyTranslateUm={morphTranslateUm}
+            morphologyMicronExtent={morphologyMicronExtent}
           />
         </div>
       </div>
@@ -441,22 +605,13 @@ export function App() {
               Notes
               <input value={annoNotes} onChange={(e) => setAnnoNotes(e.target.value)} />
             </label>
-            <button type="button" onClick={() => void submitAnnotation()}>
-              Persist polygon ROI + assign cells
-            </button>
             <button type="button" onClick={() => void submitSelectionAnnotation()}>
-              Persist current selection + assign cells
+              Save annotation (assign label to selection)
             </button>
-            {pendingRing ? (
-              <div style={{ opacity: 0.75 }}>
-                Pending polygon: {pendingRing.length} vertices (closed ring includes duplicate first point).
-              </div>
-            ) : (
-              <div style={{ opacity: 0.65 }}>Polygon mode: click vertices, Enter closes.</div>
-            )}
-            {draftPoly && draftPoly.length ? (
-              <div style={{ opacity: 0.65 }}>Draft vertices: {draftPoly.length}</div>
-            ) : null}
+            <div style={{ opacity: 0.65 }}>
+              Select cells on the map (<strong>Rectangle</strong> or <strong>Lasso</strong> mode) or click the UMAP; then
+              save. One selection set — whatever is selected gets the label.
+            </div>
             {annoStatus ? <div style={{ opacity: 0.85 }}>{annoStatus}</div> : null}
           </div>
         </div>
@@ -465,7 +620,7 @@ export function App() {
           <div style={{ fontWeight: 650, marginBottom: 8, opacity: 0.9 }}>Architecture notes</div>
           <ul style={{ margin: 0, paddingLeft: 18, lineHeight: 1.55 }}>
             <li>Viewport-filtered cell / polygon loads (server-side bbox).</li>
-            <li>Orthographic deck.gl + Bitmap H&E underlay (pyramids can swap to OpenSeadragon).</li>
+            <li>Orthographic deck.gl + morphology image underlay (multi-channel PNGs from ``Images/`` when present).</li>
             <li>Gene expression fetched per gene with column subset (Parquet), client cache.</li>
             <li>ROI persistence in PostgreSQL with derived cell tags (non-destructive vs on-disk metadata).</li>
           </ul>
@@ -479,6 +634,18 @@ function Toolbar(props: {
   samples: SampleRef[];
   sampleId: string;
   onSampleChange: (id: string) => void;
+  morphChannels: { id: string; label: string; url: string; default_visible?: boolean }[];
+  multiChannelAvailable: boolean;
+  showMultiChannel: boolean;
+  setShowMultiChannel: (v: boolean) => void;
+  multiChannelOpacity: number;
+  setMultiChannelOpacity: (v: number) => void;
+  multiChannelEnabled: Record<string, boolean>;
+  toggleMultiChannel: (id: string) => void;
+  registrationChannelId: string;
+  setRegistrationChannelId: (id: string) => void;
+  registrationExportChannelId: string | null;
+  registrationReferenceUrl: string | null;
   mode: InteractionMode;
   onMode: (m: InteractionMode) => void;
   showCentroids: boolean;
@@ -498,6 +665,11 @@ function Toolbar(props: {
   metadataColumn: string;
   setMetadataColumn: (v: string) => void;
   metadataColumns: string[];
+  metadataColumnKinds: Record<string, "numeric" | "categorical">;
+  continuousScaleMode: ContinuousScaleMode;
+  setContinuousScaleMode: (v: ContinuousScaleMode) => void;
+  /** Used to show scale controls when overlay genes are on (viridis scales still apply to overlays). */
+  overlayGeneCount: number;
   gene: string;
   setGene: (v: string) => void;
   geneFilter: string;
@@ -508,6 +680,9 @@ function Toolbar(props: {
   defaultCellRadiusScale: number;
   selectedCount: number;
   onClearSelection: () => void;
+  morphTranslateUm: [number, number];
+  onMorphShiftChange: (dx: number, dy: number) => void;
+  morphShiftError: string | null;
 }) {
   const geneOptions = Array.from(new Set([props.gene, ...props.filteredGenes].filter(Boolean)));
 
@@ -543,7 +718,7 @@ function Toolbar(props: {
         <select value={props.mode} onChange={(e) => props.onMode(e.target.value as InteractionMode)}>
           <option value="navigate">Navigate</option>
           <option value="select_rect">Rectangle select</option>
-          <option value="annotate_polygon">Polygon ROI</option>
+          <option value="select_lasso">Lasso select</option>
         </select>
       </label>
 
@@ -558,11 +733,52 @@ function Toolbar(props: {
       <span style={{ fontSize: 11, opacity: 0.55 }}>(centroids and polygons are exclusive)</span>
       <label style={{ display: "flex", gap: 8, alignItems: "center", opacity: props.showHe ? 1 : 0.45 }}>
         <input type="checkbox" checked={props.showHe} onChange={(e) => props.setShowHe(e.target.checked)} />
-        H&E
+        Morphology
       </label>
 
+      {props.morphChannels.length > 0 ? (
+        <label
+          style={{
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            fontSize: 12,
+            opacity: props.showHe ? 1 : 0.45,
+          }}
+          title="Offline registration: pick morphology channel (default DAPI from export). Export writes Images/registration_reference.png for the chosen --registration-channel."
+        >
+          Registration channel
+          <select
+            value={
+              props.morphChannels.some((c) => c.id === props.registrationChannelId)
+                ? props.registrationChannelId
+                : props.morphChannels[0]!.id
+            }
+            disabled={!props.showHe}
+            onChange={(e) => props.setRegistrationChannelId(e.target.value)}
+          >
+            {props.morphChannels.map((c) => (
+              <option key={c.id} value={c.id}>
+                {c.label}
+              </option>
+            ))}
+          </select>
+        </label>
+      ) : null}
+
+      {props.morphChannels.length > 0 && props.registrationReferenceUrl ? (
+        <span style={{ fontSize: 11, opacity: 0.62, maxWidth: 480, lineHeight: 1.35 }}>
+          Registration PNG on disk:{" "}
+          <code style={{ fontSize: 10 }}>Images/registration_reference.png</code>
+          {props.registrationExportChannelId &&
+          props.registrationChannelId === props.registrationExportChannelId
+            ? " — matches export default channel."
+            : " — export used a different channel; re-run export with --registration-channel to refresh the PNG."}
+        </span>
+      ) : null}
+
       <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
-        H&E opacity
+        Morphology opacity
         <input
           type="range"
           min={0}
@@ -572,6 +788,125 @@ function Toolbar(props: {
           onChange={(e) => props.setHeOpacity(Number(e.target.value))}
         />
       </label>
+
+      {props.multiChannelAvailable ? (
+        <>
+          <label
+            style={{
+              display: "flex",
+              gap: 8,
+              alignItems: "center",
+              fontSize: 12,
+              borderLeft: "1px solid rgba(255,255,255,0.12)",
+              paddingLeft: 10,
+            }}
+            title="All OME-TIFF segmentation planes exported as Images/*.png — independent from the Morphology reference layer."
+          >
+            <input
+              type="checkbox"
+              checked={props.showMultiChannel}
+              onChange={(e) => props.setShowMultiChannel(e.target.checked)}
+            />
+            Multi-channel
+          </label>
+          <label style={{ display: "flex", gap: 8, alignItems: "center", opacity: props.showMultiChannel ? 1 : 0.45 }}>
+            Multi α
+            <input
+              type="range"
+              min={0}
+              max={1}
+              step={0.05}
+              disabled={!props.showMultiChannel}
+              value={props.multiChannelOpacity}
+              onChange={(e) => props.setMultiChannelOpacity(Number(e.target.value))}
+            />
+          </label>
+          <span
+            style={{
+              display: "inline-flex",
+              flexWrap: "wrap",
+              gap: 8,
+              alignItems: "center",
+              fontSize: 12,
+              opacity: props.showMultiChannel ? 1 : 0.45,
+              maxWidth: 560,
+            }}
+            title="Toggle each exported segmentation channel (same µm bounds as morphology crop)."
+          >
+            {props.morphChannels.map((c) => (
+              <label key={`mc-${c.id}`} style={{ display: "inline-flex", gap: 4, alignItems: "center", cursor: "pointer" }}>
+                <input
+                  type="checkbox"
+                  checked={props.multiChannelEnabled[c.id] ?? c.default_visible !== false}
+                  disabled={!props.showMultiChannel}
+                  onChange={() => props.toggleMultiChannel(c.id)}
+                />
+                <span>{c.label}</span>
+              </label>
+            ))}
+          </span>
+        </>
+      ) : null}
+
+      <span
+        style={{
+          display: "inline-flex",
+          flexDirection: "column",
+          gap: 4,
+          fontSize: 12,
+          opacity: props.showHe ? 1 : 0.45,
+          minWidth: 210,
+        }}
+        title="Moves morphology underlay in µm; centroids/polygons stay put. Values persist to data/manifest.json (debounced)."
+      >
+        <span style={{ opacity: 0.88 }}>Morphology shift (µm)</span>
+        <span style={{ display: "flex", gap: 8, alignItems: "center", flexWrap: "wrap" }}>
+          <label style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+            Δx
+            <input
+              type="number"
+              step={0.1}
+              disabled={!props.showHe}
+              value={props.morphTranslateUm[0]}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (!Number.isFinite(v)) return;
+                props.onMorphShiftChange(v, props.morphTranslateUm[1]);
+              }}
+              style={{ width: 76 }}
+            />
+          </label>
+          <label style={{ display: "inline-flex", gap: 4, alignItems: "center" }}>
+            Δy
+            <input
+              type="number"
+              step={0.1}
+              disabled={!props.showHe}
+              value={props.morphTranslateUm[1]}
+              onChange={(e) => {
+                const v = Number(e.target.value);
+                if (!Number.isFinite(v)) return;
+                props.onMorphShiftChange(props.morphTranslateUm[0], v);
+              }}
+              style={{ width: 76 }}
+            />
+          </label>
+          <button
+            type="button"
+            disabled={!props.showHe}
+            onClick={() => props.onMorphShiftChange(0, 0)}
+            style={{ fontSize: 11, padding: "2px 8px", cursor: "pointer" }}
+          >
+            Reset
+          </button>
+        </span>
+        {props.morphShiftError ? (
+          <span style={{ color: "#ff9090", fontSize: 11 }}>{props.morphShiftError}</span>
+        ) : (
+          <span style={{ opacity: 0.55, fontSize: 10 }}>Saved to manifest automatically.</span>
+        )}
+      </span>
+
       <label
         style={{
           display: "flex",
@@ -638,6 +973,7 @@ function Toolbar(props: {
           {props.metadataColumns.map((c) => (
             <option key={c} value={c}>
               {c}
+              {props.metadataColumnKinds[c] === "numeric" ? " · continuous" : ""}
             </option>
           ))}
         </select>
@@ -674,6 +1010,31 @@ function Toolbar(props: {
           ))}
         </select>
       </label>
+
+      {(props.paintMode === "gene" ||
+        (props.paintMode === "metadata" && props.metadataColumnKinds[props.metadataColumn] === "numeric") ||
+        props.overlayGeneCount > 0) && (
+        <label
+          style={{
+            display: "flex",
+            gap: 8,
+            alignItems: "center",
+            fontSize: 12,
+          }}
+          title="Viridis endpoints use cells in the current view. Percentiles trim outliers so the colormap uses the bulk of the distribution."
+        >
+          Continuous scale
+          <select
+            value={props.continuousScaleMode}
+            onChange={(e) => props.setContinuousScaleMode(e.target.value as ContinuousScaleMode)}
+            style={{ maxWidth: 220 }}
+          >
+            <option value="full">Min–max (viewport)</option>
+            <option value="p01_p99">1st–99th percentile</option>
+            <option value="p05_p95">5th–95th percentile</option>
+          </select>
+        </label>
+      )}
 
       <label style={{ display: "flex", gap: 8, alignItems: "center" }}>
         Cell size

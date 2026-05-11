@@ -17,6 +17,9 @@ class Settings(BaseSettings):
     database_url: str = f"sqlite:///{_DEFAULT_SQLITE}"
     cors_origins: list[str] = ["http://localhost:5173", "http://127.0.0.1:5173", "*"]
     max_cells_per_viewport: int = 150_000
+    # When /api/cells is called with truncate=false (centroid overview), allow returning every
+    # cell in the bbox up to this cap. Raises response truncated=true if the sample exceeds it.
+    max_cells_full_load: int = 5_000_000
     max_polygons_per_viewport: int = 100_000
     gene_cache_size: int = 32
 

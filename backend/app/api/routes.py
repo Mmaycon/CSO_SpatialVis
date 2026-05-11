@@ -16,11 +16,13 @@ from app.cell_assignment import cells_inside_polygon
 from app.config import settings
 from app.data_store import (
     bbox_polygon_for_cell_ids,
+    invalidate_sample_parquet_caches,
     list_color_columns,
     list_expression_genes,
     list_metadata_columns_ordered,
     load_manifest,
     overlay_pathology_metadata,
+    persist_sample_image_translate_um,
     read_cells_viewport,
     read_gene_expression,
     read_plot,
@@ -41,6 +43,7 @@ from app.schemas import (
     MetadataColumnsResponse,
     GeneExpressionResponse,
     GenesResponse,
+    ImageTranslatePatch,
     PlotEnvelope,
     PolygonsResponse,
     PolygonFeature,
@@ -85,15 +88,31 @@ def _merge_roi_tags_for_cells(
     cell_ids: list[str],
 ) -> None:
     """SQLite + Postgres: upsert one tag row per (sample_id, cell_id)."""
+    seen: list[str] = []
+    seen_set: set[str] = set()
+    for x in cell_ids:
+        s = str(x).strip()
+        if s and s not in seen_set:
+            seen_set.add(s)
+            seen.append(s)
+    cell_ids = seen
+
     conf_f = float(confidence or 1.0)
     src = "roi_assignment"
-    for cid in cell_ids:
-        row = (
+
+    existing: dict[str, CellRegionTagRow] = {}
+    for i in range(0, len(cell_ids), _IN_CHUNK):
+        part = cell_ids[i : i + _IN_CHUNK]
+        for row in (
             db.query(CellRegionTagRow)
             .filter(CellRegionTagRow.sample_id == sample_id)
-            .filter(CellRegionTagRow.cell_id == cid)
-            .first()
-        )
+            .filter(CellRegionTagRow.cell_id.in_(part))
+            .all()
+        ):
+            existing[row.cell_id] = row
+
+    for cid in cell_ids:
+        row = existing.get(cid)
         if row:
             row.annotation_id = annotation_id
             row.pathology_region = label
@@ -122,6 +141,17 @@ def sample_manifest():
     return load_manifest()
 
 
+@router.patch("/sample_manifest/samples/{sample_id}/image_translate", response_model=SampleManifest)
+def patch_sample_image_translate(sample_id: str, body: ImageTranslatePatch):
+    try:
+        persist_sample_image_translate_um(sample_id, body.translate_um[0], body.translate_um[1])
+    except FileNotFoundError as e:
+        raise HTTPException(status_code=404, detail=str(e)) from e
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e)) from e
+    return load_manifest()
+
+
 @router.get("/cells", response_model=CellsResponse)
 def cells(
     sample_id: str = Query(...),
@@ -129,9 +159,13 @@ def cells(
     min_y: float = Query(...),
     max_x: float = Query(...),
     max_y: float = Query(...),
+    truncate: bool = Query(
+        True,
+        description="When false, return all cells in the bbox (up to CSO_MAX_CELLS_FULL_LOAD) for centroid overview.",
+    ),
     db: Session = Depends(get_db),
 ):
-    max_cells = settings.max_cells_per_viewport
+    max_cells = settings.max_cells_per_viewport if truncate else settings.max_cells_full_load
     rows, total, truncated = read_cells_viewport(sample_id, min_x, min_y, max_x, max_y, max_cells)
 
     cids = [r["cell_id"] for r in rows]
@@ -201,7 +235,12 @@ def list_genes(sample_id: str = Query(...)):
 @router.get("/color_columns", response_model=ColorColumnsResponse)
 def color_columns(sample_id: str = Query(...)):
     data = list_color_columns(sample_id)
-    return ColorColumnsResponse(sample_id=sample_id, metadata_columns=data["metadata_columns"], genes=data["genes"])
+    return ColorColumnsResponse(
+        sample_id=sample_id,
+        metadata_columns=data["metadata_columns"],
+        genes=data["genes"],
+        metadata_column_kinds=data.get("metadata_column_kinds") or {},
+    )
 
 
 @router.get("/metadata_columns", response_model=MetadataColumnsResponse)
@@ -396,6 +435,7 @@ def _push_roi_tags_to_parquet(db: Session, sample_id: str) -> None:
         for t in rows
     ]
     sync_sample_roi_parquet_from_tags(sample_id, tags)
+    invalidate_sample_parquet_caches(sample_id)
 
 
 @router.put("/annotations/{annotation_id}", response_model=AnnotationRecord)
@@ -467,6 +507,31 @@ def he_image(sample_id: str):
     if not p.exists():
         raise HTTPException(404)
     return FileResponse(p, media_type="image/png")
+
+
+@router.get("/assets/sample_files/{sample_id}/{file_path:path}")
+def sample_asset_file(sample_id: str, file_path: str):
+    """Serve files under a sample folder (e.g. ``Images/*.png`` from morphology export)."""
+    root = sample_dir(sample_id).resolve()
+    rel = Path(file_path)
+    if rel.is_absolute() or ".." in rel.parts:
+        raise HTTPException(400, "Invalid path")
+    target = (root / rel).resolve()
+    try:
+        target.relative_to(root)
+    except ValueError as exc:
+        raise HTTPException(403, "Path escapes sample directory") from exc
+    if not target.is_file():
+        raise HTTPException(404)
+    suf = target.suffix.lower()
+    media = {
+        ".png": "image/png",
+        ".jpg": "image/jpeg",
+        ".jpeg": "image/jpeg",
+        ".webp": "image/webp",
+        ".json": "application/json",
+    }.get(suf, "application/octet-stream")
+    return FileResponse(target, media_type=media)
 
 
 @router.get("/assets/manifest_bounds/{sample_id}")

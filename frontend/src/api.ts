@@ -1,14 +1,54 @@
 import type { CellRecord, Manifest } from "./types";
 
+/** Readable FastAPI error (`detail`) or raw body for debugging failed saves. */
+async function apiFailureMessage(r: Response, label: string): Promise<string> {
+  let raw = "";
+  try {
+    raw = await r.clone().text();
+    const j = JSON.parse(raw) as { detail?: unknown };
+    const d = j.detail;
+    if (typeof d === "string") return `${label}: ${d}`;
+    if (Array.isArray(d)) {
+      const parts = d.map((x) =>
+        typeof x === "object" && x !== null && "msg" in x ? String((x as { msg: string }).msg) : JSON.stringify(x),
+      );
+      return `${label}: ${parts.join("; ")}`;
+    }
+    if (d != null) return `${label}: ${JSON.stringify(d)}`;
+  } catch {
+    /* use raw */
+  }
+  if (raw) return `${label} (${r.status}): ${raw.slice(0, 800)}`;
+  return `${label}: HTTP ${r.status}`;
+}
+
 export async function fetchManifest(): Promise<Manifest> {
   const r = await fetch("/api/sample_manifest");
   if (!r.ok) throw new Error(`manifest ${r.status}`);
   return r.json();
 }
 
+/** Persist morphology micron shift to ``data/manifest.json`` (merged into sample override). */
+export async function patchSampleImageTranslate(
+  sampleId: string,
+  body: { translate_um: [number, number] },
+): Promise<Manifest> {
+  const r = await fetch(
+    `/api/sample_manifest/samples/${encodeURIComponent(sampleId)}/image_translate`,
+    {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ translate_um: body.translate_um }),
+    },
+  );
+  if (!r.ok) throw new Error(`image_translate ${r.status}`);
+  return r.json();
+}
+
 export async function fetchCells(
   sampleId: string,
   bbox: { min_x: number; min_y: number; max_x: number; max_y: number },
+  opts?: { truncate?: boolean },
 ): Promise<{
   cells: CellRecord[];
   truncated: boolean;
@@ -21,6 +61,9 @@ export async function fetchCells(
   u.searchParams.set("min_y", String(bbox.min_y));
   u.searchParams.set("max_x", String(bbox.max_x));
   u.searchParams.set("max_y", String(bbox.max_y));
+  if (opts?.truncate === false) {
+    u.searchParams.set("truncate", "false");
+  }
   const r = await fetch(u.toString());
   if (!r.ok) throw new Error(`cells ${r.status}`);
   return r.json();
@@ -47,6 +90,7 @@ export async function fetchColorColumns(sampleId: string): Promise<{
   sample_id: string;
   metadata_columns: string[];
   genes: string[];
+  metadata_column_kinds?: Record<string, string>;
 }> {
   const u = new URL("/api/color_columns", window.location.href);
   u.searchParams.set("sample_id", sampleId);
@@ -66,6 +110,7 @@ export async function fetchColorColumns(sampleId: string): Promise<{
       sample_id: sampleId,
       metadata_columns: metaRaw.length ? metaRaw : ["cell_type"],
       genes,
+      metadata_column_kinds: {},
     };
   }
 
@@ -81,6 +126,19 @@ export async function fetchGenes(sampleId: string): Promise<{ sample_id: string;
 }
 
 /** Full sample column if `cellIds` omitted; subset when a non-empty list is passed. */
+/** Precomputed transcript tile (``data/<sample>/transcripts/z_x_y.parquet``). Usually ``0/0/0`` for exports. */
+export async function fetchTranscripts(
+  sampleId: string,
+  tile: string,
+): Promise<{ sample_id: string; tile_key: string; points: [number, number, string][] }> {
+  const u = new URL("/api/transcripts", window.location.href);
+  u.searchParams.set("sample_id", sampleId);
+  u.searchParams.set("tile", tile);
+  const r = await fetch(u.toString());
+  if (!r.ok) throw new Error(`transcripts ${r.status}`);
+  return r.json();
+}
+
 export async function fetchGeneExpression(
   sampleId: string,
   gene: string,
@@ -135,16 +193,30 @@ export async function postAnnotationByCells(body: {
   cell_ids: string[];
   confidence?: number;
 }) {
-  const r = await fetch("/api/annotations/by_cells", {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!r.ok) throw new Error(`annotate_cells ${r.status}`);
-  return r.json() as Promise<{
-    id: string;
-    cells_assigned: number;
-    label: string;
-    sample_id: string;
-  }>;
+  const ctrl = new AbortController();
+  const tid = window.setTimeout(() => ctrl.abort(), 180_000);
+  try {
+    const r = await fetch("/api/annotations/by_cells", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+      signal: ctrl.signal,
+    });
+    if (!r.ok) throw new Error(await apiFailureMessage(r, "annotate_cells"));
+    return r.json() as Promise<{
+      id: string;
+      cells_assigned: number;
+      label: string;
+      sample_id: string;
+    }>;
+  } catch (e) {
+    if (e instanceof DOMException && e.name === "AbortError") {
+      throw new Error(
+        "annotate_cells: request timed out after 3m — large exports can be slow; check that the API is running (port 8000) and try again.",
+      );
+    }
+    throw e;
+  } finally {
+    window.clearTimeout(tid);
+  }
 }

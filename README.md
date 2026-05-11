@@ -8,6 +8,18 @@ High-performance **viewer + annotation** tool for precomputed spatial omics. The
 - **Backend:** FastAPI + PostgreSQL (annotations + derived cell tags).
 - **Data:** Parquet on disk (cells, metadata, polygons per LOD, wide expression matrix with column subsets).
 
+### Xenium morphology (many segmentation channels)
+
+Under a Xenium **region** output folder you typically find an OME-TIFF such as `morphology_focus/morphology_focus_0000.ome.tif`, `morphology_mip.ome.tif`, or `morphology.ome.tif`. To turn those planes into PNGs the viewer can load, run the exporter from this repo (writes `Images/*.png`, `he.png`, `images_manifest.json`, etc.):
+
+```bash
+python scripts/xenium_to_spatialvis.py \
+  --xenium-dir /path/to/output-...__Region__... \
+  --out-dir ./data/my_sample_id
+```
+
+In the UI, **Morphology** shows **only the registration/reference plane** chosen in the toolbar. Enable **Multi-channel** (when the export has 2+ planes) to overlay **every** exported segmentation channel with separate toggles and opacity — without blending those planes into the Morphology checkbox.
+
 ## Quick start (Docker)
 
 From this directory:

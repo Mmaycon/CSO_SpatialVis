@@ -1,19 +1,73 @@
 import DeckGL from "@deck.gl/react";
 import { COORDINATE_SYSTEM, OrthographicView, OrthographicViewport } from "@deck.gl/core";
 import { BitmapLayer, GeoJsonLayer, PathLayer, ScatterplotLayer } from "@deck.gl/layers";
+import type { BitmapBoundingBox } from "@deck.gl/layers";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import * as api from "@/api";
 import {
   VIRIDIS_GRADIENT_CSS,
   colorForMetadataKey,
+  colorForPathology,
   colorFromExpression,
+  continuousScaleModeLabel,
   overlayRgbForCell,
+  parseMetadataNumeric,
+  valueRangeForContinuousScale,
+  type ContinuousScaleMode,
 } from "@/colors";
 import { useDebouncedCallback } from "@/hooks/useDebouncedCallback";
 import type { CellRecord, SampleBounds } from "@/types";
 
-export type InteractionMode = "navigate" | "select_rect" | "annotate_polygon";
+const MORPH_TEXTURE_WARN_EDGE = 8192;
+
+function morphologyBitmapBoundsForRect(
+  minX: number,
+  minY: number,
+  maxX: number,
+  maxY: number,
+  flipY: boolean,
+  translateUm: readonly [number, number],
+): BitmapBoundingBox {
+  const [tx, ty] = translateUm;
+  const bx = (x: number) => x + tx;
+  const by = (y: number) => y + ty;
+  if (!flipY) return [bx(minX), by(minY), bx(maxX), by(maxY)];
+  return [
+    [bx(minX), by(maxY)],
+    [bx(minX), by(minY)],
+    [bx(maxX), by(minY)],
+    [bx(maxX), by(maxY)],
+  ];
+}
+
+function morphologyBitmapBounds(bounds: SampleBounds, flipY: boolean, translateUm: readonly [number, number]): BitmapBoundingBox {
+  return morphologyBitmapBoundsForRect(bounds.min_x, bounds.min_y, bounds.max_x, bounds.max_y, flipY, translateUm);
+}
+
+/** Micron-space ring (implicit edge from last vertex back to first). */
+function pointInPolygonMicrons(x: number, y: number, ring: [number, number][]): boolean {
+  const n = ring.length;
+  if (n < 3) return false;
+  let inside = false;
+  for (let i = 0, j = n - 1; i < n; j = i++) {
+    const xi = ring[i][0];
+    const yi = ring[i][1];
+    const xj = ring[j][0];
+    const yj = ring[j][1];
+    const denom = yj - yi;
+    if (Math.abs(denom) < 1e-18) continue;
+    if ((yi > y) === (yj > y)) continue;
+    const xinters = ((xj - xi) * (y - yi)) / denom + xi;
+    if (x < xinters) inside = !inside;
+  }
+  return inside;
+}
+
+const LASSO_MIN_SAMPLE_PX = 2.5;
+const LASSO_MIN_VERTICES = 3;
+
+export type InteractionMode = "navigate" | "select_rect" | "select_lasso";
 
 export type OrthoViewState = {
   ortho: {
@@ -38,6 +92,10 @@ type Props = {
   polygonOpacity: number;
   /** Metadata column key (from cell_metadata / `$ManualAnno:*`) when paintMode is metadata */
   metadataColumn: string;
+  /** From API / parquet inference: numeric columns use viridis (viewport min–max); others use categorical colors. */
+  metadataColumnKind?: "numeric" | "categorical";
+  /** Viridis endpoints: full min/max in view vs percentile clipping for gene & numeric metadata & overlays. */
+  continuousScaleMode?: ContinuousScaleMode;
   paintMode: "metadata" | "gene";
   gene: string;
   /** Up to 3 genes: viridis (1) or RGB channels (2–3). Drawn on top of base coloring. */
@@ -47,10 +105,21 @@ type Props = {
   dataRevision?: number;
   selectedIds: ReadonlySet<string>;
   onToggleSelected: (ids: string[], replace: boolean) => void;
-  onDraftPolygon: (ring: [number, number][] | null) => void;
-  onPolygonClosed: (ring: [number, number][]) => void;
+  /** Reference morphology plane only (registration channel). When absent, loads ``he.png`` only. */
+  morphologyChannels?: Array<{ id: string; label: string; url: string; default_visible?: boolean }>;
+  /** All segmentation PNGs from the OME export — separate layer from Morphology. */
+  showMultiChannel?: boolean;
+  multiChannelChannels?: Array<{ id: string; label: string; url: string; default_visible?: boolean }>;
+  multiChannelEnabled?: Record<string, boolean>;
+  multiChannelOpacity?: number;
   /** Multiplier for centroid pixel radius (1 = built-in zoom-aware default). */
   cellRadiusScale?: number;
+  /** When true, flip morphology texture V vs micron Y (``image.alignment.flip_y`` / ``images_manifest.viewer_flip_y``). */
+  morphologyFlipY?: boolean;
+  /** Micron shift applied only to morphology BitmapLayer corners (``image.alignment.translate_um``). */
+  morphologyTranslateUm?: readonly [number, number];
+  /** ``morphology_frame.crop_microns``: morphology quads align here so overview matches cells on segmentation crop. */
+  morphologyMicronExtent?: SampleBounds | null;
 };
 
 function initialOrthoForBounds(bounds: SampleBounds, width: number, height: number): OrthoViewState {
@@ -283,6 +352,9 @@ function worldBBoxFromViewState(vs: OrthoViewState, width: number, height: numbe
  */
 const POLYGON_MAX_VIEWPORT_AREA_FRACTION = 0.22;
 
+/** Cap transcript glyphs per frame after viewport filter (dense Xenium tiles). */
+const MAX_TRANSCRIPTS_DRAW = 120_000;
+
 function isViewportSmallEnoughForPolygons(
   bbox: { min_x: number; min_y: number; max_x: number; max_y: number },
   bounds: SampleBounds,
@@ -311,6 +383,7 @@ function filterCellsInViewport(
 
 export function SpatialViewer(props: Props) {
   const cellRadiusScale = props.cellRadiusScale ?? 1;
+  const morphWorldBounds = props.morphologyMicronExtent ?? props.bounds;
   const overlayGenes = props.overlayGenes ?? [];
   const overlayOpacityFactor = props.overlayOpacity ?? 0.9;
   const overlayActive = overlayGenes.length > 0;
@@ -321,10 +394,14 @@ export function SpatialViewer(props: Props) {
   );
 
   /**
-   * Merged from every /api/cells response for this sample. Zooming/panning filters this to the
-   * current view so zoom-out is instant for regions already seen; new areas still refetch in the background.
+   * Merged from every /api/cells response for this sample. In centroid mode the cache is filled once
+   * with the full sample (no viewport subsampling); pan/zoom only changes which dots are visible.
    */
   const [cellCache, setCellCache] = useState(() => new Map<string, CellRecord>());
+  const cellCacheRef = useRef(cellCache);
+  cellCacheRef.current = cellCache;
+  /** Whether the last full-sample centroid load hit CSO_MAX_CELLS_FULL_LOAD (HUD only). */
+  const centroidLoadTruncatedRef = useRef(false);
 
   const [geojson, setGeojson] = useState<{ type: "FeatureCollection"; features: any[] }>({
     type: "FeatureCollection",
@@ -333,12 +410,17 @@ export function SpatialViewer(props: Props) {
   const [geneMap, setGeneMap] = useState<Record<string, number>>({});
   const [overlayMaps, setOverlayMaps] = useState<Record<string, Record<string, number>>>({});
   const [hoverCell, setHoverCell] = useState<CellRecord | null>(null);
-  const [heTexture, setHeTexture] = useState<HTMLImageElement | null>(null);
+  const [morphTextures, setMorphTextures] = useState<Record<string, HTMLImageElement>>({});
+  const [multiChannelTextures, setMultiChannelTextures] = useState<Record<string, HTMLImageElement>>({});
+  const [morphTextureMaxEdge, setMorphTextureMaxEdge] = useState<number | null>(null);
   const [dragRect, setDragRect] = useState<{ x0: number; y0: number; x1: number; y1: number } | null>(
     null,
   );
   const dragActive = useRef(false);
-  const [polyDraft, setPolyDraft] = useState<[number, number][]>([]);
+  /** Freehand lasso in overlay pixel coords (preview mirrors ref so pointer-up sees the full stroke). */
+  const [lassoScreenPath, setLassoScreenPath] = useState<Array<{ x: number; y: number }> | null>(null);
+  const lassoScreenPathRef = useRef<Array<{ x: number; y: number }>>([]);
+  const lassoDraggingRef = useRef(false);
   /** Last /api/cells stats so you can confirm viewport loading vs dataset size */
   const [viewportCellStats, setViewportCellStats] = useState<{
     totalInViewport: number;
@@ -355,6 +437,10 @@ export function SpatialViewer(props: Props) {
   const viewportFetchGen = useRef(0);
   const lodRef = useRef(2);
 
+  const [transcriptTilePoints, setTranscriptTilePoints] = useState<[number, number, string][]>([]);
+  const [transcriptLoadError, setTranscriptLoadError] = useState<string | null>(null);
+  const [transcriptLoading, setTranscriptLoading] = useState(false);
+
   useEffect(() => {
     const el = containerRef.current;
     if (!el) return;
@@ -367,6 +453,12 @@ export function SpatialViewer(props: Props) {
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
+
+  useEffect(() => {
+    setLassoScreenPath(null);
+    lassoScreenPathRef.current = [];
+    lassoDraggingRef.current = false;
+  }, [props.mode]);
 
   const bumpZoom = useCallback((delta: number) => {
     setViewState((vs) => ({
@@ -383,17 +475,116 @@ export function SpatialViewer(props: Props) {
   }, [props.bounds, size.h, size.w]);
 
   useEffect(() => {
-    const im = new Image();
-    im.crossOrigin = "anonymous";
-    im.onload = () => setHeTexture(im);
-    im.src = `/api/assets/he/${props.sampleId}`;
-  }, [props.sampleId]);
+    if (!props.showHe) {
+      setMorphTextures({});
+      setMorphTextureMaxEdge(null);
+      return;
+    }
+
+    const chans = props.morphologyChannels ?? [];
+    if (!chans.length) {
+      const im = new Image();
+      im.crossOrigin = "anonymous";
+      im.onload = () => {
+        setMorphTextures({ __legacy__: im });
+        setMorphTextureMaxEdge(Math.max(im.naturalWidth, im.naturalHeight));
+      };
+      im.src = `/api/assets/he/${props.sampleId}`;
+      return;
+    }
+
+    let cancelled = false;
+    const loaders = chans.map(
+        (c) =>
+          new Promise<[string, HTMLImageElement]>((resolve, reject) => {
+            const im = new Image();
+            im.crossOrigin = "anonymous";
+            im.onload = () => resolve([String(c.id), im]);
+            im.onerror = () => reject(new Error(String(c.id)));
+            const u = c.url.startsWith("/") || c.url.startsWith("http") ? c.url : `/${c.url}`;
+            im.src = u;
+          }),
+      );
+
+    void Promise.allSettled(loaders).then((results) => {
+      if (cancelled) return;
+      const map: Record<string, HTMLImageElement> = {};
+      let maxEdge = 0;
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          const [id, im] = r.value;
+          map[id] = im;
+          maxEdge = Math.max(maxEdge, im.naturalWidth, im.naturalHeight);
+        }
+      }
+      setMorphTextures(map);
+      setMorphTextureMaxEdge(maxEdge > 0 ? maxEdge : null);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [props.sampleId, props.showHe, props.morphologyChannels]);
+
+  useEffect(() => {
+    if (!props.showMultiChannel) {
+      setMultiChannelTextures({});
+      return;
+    }
+    const chans = props.multiChannelChannels ?? [];
+    if (!chans.length) {
+      setMultiChannelTextures({});
+      return;
+    }
+
+    let cancelled = false;
+    const loaders = chans
+      .filter((c) => (props.multiChannelEnabled ?? {})[c.id] !== false)
+      .map(
+        (c) =>
+          new Promise<[string, HTMLImageElement]>((resolve, reject) => {
+            const im = new Image();
+            im.crossOrigin = "anonymous";
+            im.onload = () => resolve([String(c.id), im]);
+            im.onerror = () => reject(new Error(String(c.id)));
+            const u = c.url.startsWith("/") || c.url.startsWith("http") ? c.url : `/${c.url}`;
+            im.src = u;
+          }),
+      );
+
+    void Promise.allSettled(loaders).then((results) => {
+      if (cancelled) return;
+      const map: Record<string, HTMLImageElement> = {};
+      for (const r of results) {
+        if (r.status === "fulfilled") {
+          const [id, im] = r.value;
+          map[id] = im;
+        }
+      }
+      setMultiChannelTextures(map);
+    });
+
+    return () => {
+      cancelled = true;
+    };
+  }, [props.sampleId, props.showMultiChannel, props.multiChannelChannels, props.multiChannelEnabled]);
 
   const debouncedReload = useDebouncedCallback(
     async (bbox: { min_x: number; min_y: number; max_x: number; max_y: number }) => {
       const gen = ++viewportFetchGen.current;
-      setViewportLoading(true);
       setViewportLoadError(null);
+      if (props.showCentroids) {
+        setGeojson({ type: "FeatureCollection", features: [] });
+        setViewportPolyStats(null);
+        const inView = filterCellsInViewport(cellCacheRef.current, bbox);
+        setViewportCellStats({
+          totalInViewport: inView.length,
+          truncated: centroidLoadTruncatedRef.current,
+        });
+        return;
+      }
+
+      setViewportLoading(true);
       try {
         const cRes = await api.fetchCells(props.sampleId, bbox);
         if (gen !== viewportFetchGen.current) return;
@@ -477,6 +668,49 @@ export function SpatialViewer(props: Props) {
   }, [props.dataRevision, props.sampleId]);
 
   useEffect(() => {
+    if (!props.showCentroids) return;
+    let cancelled = false;
+    setViewportLoading(true);
+    setViewportLoadError(null);
+    void (async () => {
+      try {
+        const cRes = await api.fetchCells(props.sampleId, props.bounds, { truncate: false });
+        if (cancelled) return;
+        const n = new Map<string, CellRecord>();
+        for (const c of cRes.cells) {
+          n.set(c.cell_id, c);
+        }
+        setCellCache(n);
+        centroidLoadTruncatedRef.current = Boolean(cRes.truncated);
+        setViewportCellStats({
+          totalInViewport: cRes.total_in_viewport,
+          truncated: Boolean(cRes.truncated),
+        });
+      } catch (e) {
+        if (cancelled) return;
+        setViewportLoadError(e instanceof Error ? e.message : String(e));
+        setViewportCellStats(null);
+      } finally {
+        if (!cancelled) {
+          setViewportLoading(false);
+        }
+      }
+    })();
+    return () => {
+      cancelled = true;
+      setViewportLoading(false);
+    };
+  }, [
+    props.showCentroids,
+    props.sampleId,
+    props.dataRevision,
+    props.bounds.min_x,
+    props.bounds.min_y,
+    props.bounds.max_x,
+    props.bounds.max_y,
+  ]);
+
+  useEffect(() => {
     reloadViewport();
   }, [reloadViewport, props.sampleId]);
 
@@ -529,25 +763,31 @@ export function SpatialViewer(props: Props) {
     };
   }, [props.paintMode, props.gene, props.sampleId]);
 
-  /** Viridis range from the current viewport only (contrast); values still come from full column. */
+  const scaleMode = props.continuousScaleMode ?? "full";
+
+  /** Viridis range from the current viewport (respects continuous scale mode). */
   const exprRange = useMemo(() => {
     const vals: number[] = [];
     for (const c of visibleCells) {
       const v = geneMap[c.cell_id];
       if (typeof v === "number" && Number.isFinite(v)) vals.push(v);
     }
-    if (!vals.length) return { vmin: 0, vmax: 1 };
-    let vmin = Infinity;
-    let vmax = -Infinity;
-    for (const v of vals) {
-      vmin = Math.min(vmin, v);
-      vmax = Math.max(vmax, v);
+    return valueRangeForContinuousScale(vals, scaleMode);
+  }, [geneMap, visibleCells, scaleMode]);
+
+  /** Viridis range for continuous metadata (viewport cells + scale mode). */
+  const metadataNumericRange = useMemo(() => {
+    if (props.paintMode !== "metadata" || props.metadataColumnKind !== "numeric") {
+      return { vmin: 0, vmax: 1 };
     }
-    if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
-      return { vmin: vmin, vmax: vmin + 1e-9 };
+    const key = props.metadataColumn || "cell_type";
+    const vals: number[] = [];
+    for (const c of visibleCells) {
+      const v = parseMetadataNumeric(c.metadata[key]);
+      if (v !== null && Number.isFinite(v)) vals.push(v);
     }
-    return { vmin, vmax };
-  }, [geneMap, visibleCells]);
+    return valueRangeForContinuousScale(vals, scaleMode);
+  }, [props.paintMode, props.metadataColumnKind, props.metadataColumn, visibleCells, scaleMode]);
 
   const overlayRanges = useMemo(() => {
     const out: Record<string, { vmin: number; vmax: number }> = {};
@@ -558,24 +798,10 @@ export function SpatialViewer(props: Props) {
         const v = m[c.cell_id];
         if (typeof v === "number" && Number.isFinite(v)) vals.push(v);
       }
-      if (!vals.length) {
-        out[g] = { vmin: 0, vmax: 1 };
-        continue;
-      }
-      let vmin = Infinity;
-      let vmax = -Infinity;
-      for (const v of vals) {
-        vmin = Math.min(vmin, v);
-        vmax = Math.max(vmax, v);
-      }
-      if (!Number.isFinite(vmin) || !Number.isFinite(vmax) || vmax <= vmin) {
-        out[g] = { vmin, vmax: vmin + 1e-9 };
-      } else {
-        out[g] = { vmin, vmax };
-      }
+      out[g] = valueRangeForContinuousScale(vals, scaleMode);
     }
     return out;
-  }, [overlayGenes, overlayMaps, visibleCells]);
+  }, [overlayGenes, overlayMaps, visibleCells, scaleMode]);
 
   const cellById = useMemo(() => new Map([...cellCache.values()].map((c) => [c.cell_id, c])), [cellCache]);
 
@@ -585,19 +811,62 @@ export function SpatialViewer(props: Props) {
   );
 
   const layers = useMemo(() => {
-    const { vmin, vmax } = exprRange;
+    const geneVmin = exprRange.vmin;
+    const geneVmax = exprRange.vmax;
+    const metaVmin = metadataNumericRange.vmin;
+    const metaVmax = metadataNumericRange.vmax;
     const zoom = viewState.ortho.zoom;
     const ls: unknown[] = [];
-    if (props.showHe && heTexture) {
-      ls.push(
-        new BitmapLayer({
-          id: "he",
-          image: heTexture,
-          bounds: [props.bounds.min_x, props.bounds.min_y, props.bounds.max_x, props.bounds.max_y],
-          opacity: props.heOpacity,
-          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-        }),
-      );
+    const flipM = props.morphologyFlipY ?? false;
+    const transM = props.morphologyTranslateUm ?? [0, 0];
+    const morphBounds = morphologyBitmapBounds(morphWorldBounds, flipM, transM);
+
+    if (props.showHe && Object.keys(morphTextures).length > 0) {
+      const mc = props.morphologyChannels ?? [];
+      if (morphTextures.__legacy__) {
+        ls.push(
+          new BitmapLayer({
+            id: "he",
+            image: morphTextures.__legacy__,
+            bounds: morphBounds,
+            opacity: props.heOpacity,
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+          }),
+        );
+      } else {
+        for (const c of mc) {
+          const tex = morphTextures[String(c.id)];
+          if (!tex) continue;
+          ls.push(
+            new BitmapLayer({
+              id: `morph-${c.id}`,
+              image: tex,
+              bounds: morphBounds,
+              opacity: props.heOpacity,
+              coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+            }),
+          );
+        }
+      }
+    }
+
+    const mcLayerOpacity = props.multiChannelOpacity ?? 0.78;
+    if (props.showMultiChannel && Object.keys(multiChannelTextures).length > 0) {
+      const mcc = props.multiChannelChannels ?? [];
+      for (const c of mcc) {
+        if ((props.multiChannelEnabled ?? {})[c.id] === false) continue;
+        const tex = multiChannelTextures[String(c.id)];
+        if (!tex) continue;
+        ls.push(
+          new BitmapLayer({
+            id: `seg-ch-${c.id}`,
+            image: tex,
+            bounds: morphBounds,
+            opacity: mcLayerOpacity,
+            coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
+          }),
+        );
+      }
     }
 
     if (props.showPolygons && scaledGeojson.features.length) {
@@ -620,10 +889,14 @@ export function SpatialViewer(props: Props) {
             if (!rec) return [80, 80, 90, 210];
             if (props.paintMode === "gene") {
               const v = geneMap[rec.cell_id];
-              return colorFromExpression(v ?? NaN, vmin, vmax);
+              return colorFromExpression(v ?? NaN, geneVmin, geneVmax);
             }
             const key = props.metadataColumn || "cell_type";
             const raw = rec.metadata[key];
+            if (props.metadataColumnKind === "numeric") {
+              const v = parseMetadataNumeric(raw);
+              return colorFromExpression(v ?? NaN, metaVmin, metaVmax);
+            }
             return colorForMetadataKey(key, raw);
           },
           pickable: props.mode === "navigate",
@@ -632,10 +905,13 @@ export function SpatialViewer(props: Props) {
             getFillColor: [
               props.paintMode,
               props.metadataColumn,
+              props.metadataColumnKind,
               props.selectedIds,
               geneMap,
-              vmin,
-              vmax,
+              geneVmin,
+              geneVmax,
+              metaVmin,
+              metaVmax,
               overlayActive,
               cellById,
             ],
@@ -708,13 +984,16 @@ export function SpatialViewer(props: Props) {
             const selected = props.selectedIds.has(d.cell_id) ? 1 : 0;
             if (props.paintMode === "gene") {
               const v = geneMap[d.cell_id];
-              const c = colorFromExpression(v ?? NaN, vmin, vmax);
+              const c = colorFromExpression(v ?? NaN, geneVmin, geneVmax);
               if (selected) return [255, 255, 120, 255] as [number, number, number, number];
               return c;
             }
             const key = props.metadataColumn || "cell_type";
             const raw = d.metadata[key];
-            const c = colorForMetadataKey(key, raw);
+            const c =
+              props.metadataColumnKind === "numeric"
+                ? colorFromExpression(parseMetadataNumeric(raw) ?? NaN, metaVmin, metaVmax)
+                : colorForMetadataKey(key, raw);
             if (selected) return [255, 255, 120, 255] as [number, number, number, number];
             return c;
           },
@@ -727,10 +1006,13 @@ export function SpatialViewer(props: Props) {
             getFillColor: [
               props.paintMode,
               props.metadataColumn,
+              props.metadataColumnKind,
               props.selectedIds,
               geneMap,
-              vmin,
-              vmax,
+              geneVmin,
+              geneVmax,
+              metaVmin,
+              metaVmax,
               overlayActive,
               visibleCells,
             ],
@@ -770,33 +1052,26 @@ export function SpatialViewer(props: Props) {
       );
     }
 
-    if (polyDraft.length >= 2) {
-      ls.push(
-        new PathLayer({
-          id: "draft-poly-line",
-          data: [{ path: polyDraft }],
-          coordinateSystem: COORDINATE_SYSTEM.CARTESIAN,
-          getPath: (d: { path: [number, number][] }) => d.path,
-          getColor: [255, 230, 80, 220],
-          getWidth: Math.max(1.25, 1.75 * cellRadiusScale),
-          widthUnits: "pixels",
-          updateTriggers: { getWidth: [cellRadiusScale] },
-        }),
-      );
-    }
-
     return ls as any;
   }, [
     visibleCells,
     exprRange,
+    metadataNumericRange,
     geneMap,
     scaledGeojson,
     cellById,
-    heTexture,
-    polyDraft,
+    morphTextures,
+    multiChannelTextures,
+    props.morphologyChannels,
+    props.showMultiChannel,
+    props.multiChannelChannels,
+    props.multiChannelEnabled,
+    props.multiChannelOpacity,
     props.bounds,
+    morphWorldBounds,
     props.centroidOpacity,
     props.metadataColumn,
+    props.metadataColumnKind,
     props.paintMode,
     props.gene,
     props.heOpacity,
@@ -808,6 +1083,8 @@ export function SpatialViewer(props: Props) {
     props.showPolygons,
     cellRadiusScale,
     viewState.ortho.zoom,
+    props.morphologyFlipY,
+    props.morphologyTranslateUm,
     overlayActive,
     overlayGenes,
     overlayMaps,
@@ -837,23 +1114,36 @@ export function SpatialViewer(props: Props) {
     if (props.mode === "select_rect") {
       dragActive.current = true;
       setDragRect({ x0: x, y0: y, x1: x, y1: y });
-    } else if (props.mode === "annotate_polygon") {
-      const [wx, wy] = unproject(x, y);
-      setPolyDraft((prev) => {
-        const next = [...prev, [wx, wy]] as [number, number][];
-        props.onDraftPolygon(next);
-        return next;
-      });
+    } else if (props.mode === "select_lasso") {
+      lassoDraggingRef.current = true;
+      const start = [{ x, y }];
+      lassoScreenPathRef.current = start;
+      setLassoScreenPath(start);
+      (e.currentTarget as HTMLElement).setPointerCapture(e.pointerId);
     }
   };
 
   const onOverlayPointerMove = (e: React.PointerEvent) => {
-    if (!dragActive.current || !dragRect || props.mode !== "select_rect") return;
     const rect = containerRef.current?.getBoundingClientRect();
     if (!rect) return;
     const x = e.clientX - rect.left;
     const y = e.clientY - rect.top;
-    setDragRect({ ...dragRect, x1: x, y1: y });
+
+    if (props.mode === "select_rect") {
+      if (!dragActive.current) return;
+      setDragRect((dr) => (dr ? { ...dr, x1: x, y1: y } : dr));
+      return;
+    }
+
+    if (props.mode !== "select_lasso" || !lassoDraggingRef.current) return;
+    setLassoScreenPath((prev) => {
+      if (!prev?.length) return prev;
+      const last = prev[prev.length - 1];
+      if (Math.hypot(x - last.x, y - last.y) < LASSO_MIN_SAMPLE_PX) return prev;
+      const next = [...prev, { x, y }];
+      lassoScreenPathRef.current = next;
+      return next;
+    });
   };
 
   const onOverlayPointerUp = (e: React.PointerEvent) => {
@@ -875,26 +1165,41 @@ export function SpatialViewer(props: Props) {
         .map((c) => c.cell_id);
       props.onToggleSelected(picked, !e.shiftKey);
       setDragRect(null);
+    } else if (props.mode === "select_lasso" && lassoDraggingRef.current) {
+      const rectUp = containerRef.current?.getBoundingClientRect();
+      let path = lassoScreenPathRef.current;
+      if (rectUp?.width != null && path.length) {
+        const x = e.clientX - rectUp.left;
+        const y = e.clientY - rectUp.top;
+        const last = path[path.length - 1];
+        if (Math.hypot(x - last.x, y - last.y) >= 0.5) {
+          path = [...path, { x, y }];
+          lassoScreenPathRef.current = path;
+        }
+      }
+      if (path.length >= LASSO_MIN_VERTICES) {
+        const ringWorld: [number, number][] = path.map((p) => unproject(p.x, p.y));
+        const picked = visibleCells
+          .filter((c) => pointInPolygonMicrons(c.x, c.y, ringWorld))
+          .map((c) => c.cell_id);
+        props.onToggleSelected(picked, !e.shiftKey);
+      }
     }
-    dragActive.current = false;
-  };
 
-  useEffect(() => {
-    const onKey = (ev: KeyboardEvent) => {
-      if (ev.key === "Escape") {
-        setPolyDraft([]);
-        props.onDraftPolygon(null);
+    if (props.mode === "select_lasso" && lassoDraggingRef.current) {
+      try {
+        (e.currentTarget as HTMLElement).releasePointerCapture(e.pointerId);
+      } catch {
+        /* already released */
       }
-      if (ev.key === "Enter" && props.mode === "annotate_polygon" && polyDraft.length >= 3) {
-        const ring = [...polyDraft, polyDraft[0]] as [number, number][];
-        props.onPolygonClosed(ring);
-        setPolyDraft([]);
-        props.onDraftPolygon(null);
-      }
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, [polyDraft, props, props.mode]);
+    }
+
+    lassoDraggingRef.current = false;
+    lassoScreenPathRef.current = [];
+    setLassoScreenPath(null);
+    dragActive.current = false;
+    setDragRect(null);
+  };
 
   const deckViewState = useMemo(
     () => ({
@@ -954,11 +1259,7 @@ export function SpatialViewer(props: Props) {
           inset: 0,
           pointerEvents: props.mode === "navigate" ? "none" : "auto",
           cursor:
-            props.mode === "select_rect"
-              ? "crosshair"
-              : props.mode === "annotate_polygon"
-                ? "cell"
-                : "default",
+            props.mode === "select_rect" || props.mode === "select_lasso" ? "crosshair" : "default",
         }}
         onPointerDown={onOverlayPointerDown}
         onPointerMove={onOverlayPointerMove}
@@ -978,6 +1279,36 @@ export function SpatialViewer(props: Props) {
           }}
         />
       )}
+      {lassoScreenPath && lassoScreenPath.length >= 2 ? (
+        <svg
+          style={{
+            position: "absolute",
+            inset: 0,
+            width: "100%",
+            height: "100%",
+            pointerEvents: "none",
+            zIndex: 1,
+          }}
+        >
+          <polyline
+            fill="none"
+            stroke="rgba(255,255,120,0.95)"
+            strokeWidth={1.75}
+            strokeLinejoin="round"
+            strokeLinecap="round"
+            points={lassoScreenPath.map((p) => `${p.x},${p.y}`).join(" ")}
+          />
+          <line
+            x1={lassoScreenPath[lassoScreenPath.length - 1].x}
+            y1={lassoScreenPath[lassoScreenPath.length - 1].y}
+            x2={lassoScreenPath[0].x}
+            y2={lassoScreenPath[0].y}
+            stroke="rgba(255,255,120,0.45)"
+            strokeWidth={1}
+            strokeDasharray="5 4"
+          />
+        </svg>
+      ) : null}
       <div
         style={{
           position: "absolute",
@@ -996,7 +1327,9 @@ export function SpatialViewer(props: Props) {
             <span style={{ color: "#a8d4ff" }}>
               {props.showPolygons && polygonLoadAllowed
                 ? "Loading cells & cell outlines…"
-                : "Loading cells…"}{" "}
+                : props.showCentroids
+                  ? "Loading all cell centroids for this sample…"
+                  : "Loading cells…"}{" "}
               <span style={{ opacity: 0.75 }}>(the API caches data after the first read in each process)</span>
             </span>
           ) : null}
@@ -1004,6 +1337,14 @@ export function SpatialViewer(props: Props) {
             <span style={{ color: "#ff9090", display: "block", marginBottom: 6 }}>
               Load failed: {viewportLoadError}
             </span>
+          ) : null}
+          {morphTextureMaxEdge != null &&
+          morphTextureMaxEdge > MORPH_TEXTURE_WARN_EDGE &&
+          props.showHe ? (
+            <div style={{ color: "#ffb070", marginBottom: 6, lineHeight: 1.45 }}>
+              Large morphology texture ({morphTextureMaxEdge}px long edge). Some GPUs may be slow or hit WebGL limits;
+              re-export with a smaller --morphology-max-long-edge if needed.
+            </div>
           ) : null}
           {!viewportLoading && props.showPolygons && !polygonLoadAllowed ? (
             <div style={{ color: "#ffb070", marginBottom: 6, lineHeight: 1.45 }}>
@@ -1016,14 +1357,22 @@ export function SpatialViewer(props: Props) {
             <>
               Cells drawn: {visibleCells.length}
               {cellCache.size > 0 ? (
-                <span style={{ opacity: 0.7 }}> · {cellCache.size.toLocaleString()} unique in memory (pan/zoom reuses; new areas still fetch)</span>
+                <span style={{ opacity: 0.7 }}>
+                  {" "}
+                  · {cellCache.size.toLocaleString()} in memory
+                  {props.showCentroids ? " (full sample for centroids)" : " (pan/zoom merges new areas)"}
+                </span>
               ) : null}
               {viewportCellStats != null ? (
                 <>
                   {" "}
                   · {viewportCellStats.totalInViewport.toLocaleString()} in view rectangle
                   {viewportCellStats.truncated ? (
-                    <span style={{ color: "#ffb070" }}> · cells capped (CSO_MAX_CELLS_PER_VIEWPORT)</span>
+                    <span style={{ color: "#ffb070" }}>
+                      {" "}
+                      · cells capped (
+                      {props.showCentroids ? "CSO_MAX_CELLS_FULL_LOAD" : "CSO_MAX_CELLS_PER_VIEWPORT"})
+                    </span>
                   ) : null}
                 </>
               ) : null}
@@ -1055,7 +1404,7 @@ export function SpatialViewer(props: Props) {
           )}
         </div>
         <div style={{ opacity: 0.65, marginTop: 4 }}>
-          Scroll/pinch to zoom · Drag to pan (Navigate) · Rect select · Polygon ROI: vertices + Enter · Empty view?{" "}
+          Scroll/pinch to zoom · Drag to pan (Navigate) · Rectangle or lasso select for ROI labels · Empty view?{" "}
           <span style={{ opacity: 0.9 }}>Reset</span> (top-right)
         </div>
       </div>
@@ -1100,7 +1449,12 @@ export function SpatialViewer(props: Props) {
           style={{
             position: "absolute",
             right: 10,
-            bottom: overlayActive && props.paintMode === "gene" ? 118 : 10,
+            bottom:
+              overlayActive &&
+              (props.paintMode === "gene" ||
+                (props.paintMode === "metadata" && props.metadataColumnKind === "numeric"))
+                ? 118
+                : 10,
             width: 220,
             background: "rgba(0,0,0,0.55)",
             padding: "8px 10px",
@@ -1112,7 +1466,7 @@ export function SpatialViewer(props: Props) {
           <div style={{ opacity: 0.9, marginBottom: 6 }}>Overlay expression</div>
           <div style={{ opacity: 0.8, lineHeight: 1.4 }}>
             {overlayGenes.length === 1
-              ? `${overlayGenes[0]} (viridis, viewport min/max)`
+              ? `${overlayGenes[0]} (viridis · ${continuousScaleModeLabel(scaleMode)})`
               : overlayGenes.length === 2
                 ? `R: ${overlayGenes[0]} · G: ${overlayGenes[1]}`
                 : `R: ${overlayGenes[0]} · G: ${overlayGenes[1]} · B: ${overlayGenes[2]}`}
@@ -1151,7 +1505,41 @@ export function SpatialViewer(props: Props) {
             <span>{exprRange.vmin.toPrecision(4)}</span>
             <span>{exprRange.vmax.toPrecision(4)}</span>
           </div>
-          <div style={{ opacity: 0.65, marginTop: 4 }}>Scale = min/max of loaded viewport cells</div>
+          <div style={{ opacity: 0.65, marginTop: 4 }}>
+            Scale: {continuousScaleModeLabel(scaleMode)} · viewport cells
+          </div>
+        </div>
+      ) : props.paintMode === "metadata" && props.metadataColumnKind === "numeric" ? (
+        <div
+          style={{
+            position: "absolute",
+            right: 10,
+            bottom: 10,
+            width: 220,
+            background: "rgba(0,0,0,0.55)",
+            padding: "8px 10px",
+            borderRadius: 8,
+            fontSize: 11,
+            pointerEvents: "none",
+          }}
+        >
+          <div style={{ opacity: 0.9, marginBottom: 6 }}>
+            Metadata: {props.metadataColumn} <span style={{ opacity: 0.75 }}>(continuous · viridis)</span>
+          </div>
+          <div
+            style={{
+              height: 10,
+              borderRadius: 4,
+              background: VIRIDIS_GRADIENT_CSS,
+            }}
+          />
+          <div style={{ display: "flex", justifyContent: "space-between", opacity: 0.8, marginTop: 4 }}>
+            <span>{metadataNumericRange.vmin.toPrecision(4)}</span>
+            <span>{metadataNumericRange.vmax.toPrecision(4)}</span>
+          </div>
+          <div style={{ opacity: 0.65, marginTop: 4 }}>
+            Scale: {continuousScaleModeLabel(scaleMode)} · viewport cells
+          </div>
         </div>
       ) : null}
     </div>

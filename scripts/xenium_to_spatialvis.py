@@ -6,8 +6,9 @@ Same file layout as ``xenium_subset_to_spatialvis.py``, but **no random subsampl
 every cell in the export pool is written (subject to the same cells∩matrix filter as the subset
 script, unless ``--ignore-matrix-barcode-filter``).
 
-The transcript tile ``transcripts/0_0_0.parquet`` may still be **row-capped** via
-``--transcript-max`` for performance on huge runs; raise it if you need more points.
+By default the transcript tile is **empty** (fast); pass ``--export-transcripts`` to read and
+downsample transcripts. When exporting, the tile may be **row-capped** via ``--transcript-max``
+for huge runs; raise it if you need more points.
 
 Dependencies:
   pip install -r scripts/requirements-xenium-pipeline.txt
@@ -84,16 +85,57 @@ def parse_args_full() -> argparse.Namespace:
         default=200_000,
         help="Max transcript rows in transcripts/0_0_0.parquet (tile); increase for denser tiles.",
     )
-    ap.add_argument("--he-long-edge", type=int, default=1600, help="PNG long edge in pixels")
+    ap.add_argument(
+        "--he-long-edge",
+        type=int,
+        default=0,
+        help="Morphology PNG long edge (0 = native ROI resolution, capped by --morphology-max-long-edge). "
+        "Use e.g. 1600 for a lighter demo pyramid.",
+    )
+    ap.add_argument(
+        "--morphology-max-long-edge",
+        type=int,
+        default=8192,
+        help="Hard cap on morphology PNG long edge (native or resized)",
+    )
+    ap.add_argument(
+        "--morphology-level",
+        type=int,
+        default=-1,
+        help="OME-TIFF pyramid level (0 = finest; -1 = auto)",
+    )
+    ap.add_argument(
+        "--morphology-z-projection",
+        choices=("max", "mean", "middle"),
+        default="max",
+        help="Z-stack collapse for multi-plane morphology",
+    )
+    ap.add_argument(
+        "--morphology-flip-y",
+        action="store_true",
+        help="Flip morphology vertically after micron crop",
+    )
     ap.add_argument(
         "--skip-he-morphology",
         action="store_true",
         help="Do not try to read OME-TIFF; write a placeholder he.png in cropped bounds only",
     )
     ap.add_argument(
+        "--export-transcripts",
+        action="store_true",
+        help="Read and export transcripts/0_0_0.parquet (default: skip; empty tile only)",
+    )
+    ap.add_argument(
         "--ignore-matrix-barcode-filter",
         action="store_true",
         help="Include all cells from cells.parquet even if absent from feature matrix (zeros in expression-wide).",
+    )
+    ap.add_argument(
+        "--registration-channel",
+        type=str,
+        default="dapi",
+        help="Morphology channel copied to Images/registration_reference.png for registration pipelines "
+        "(id, label, substring, or index; default dapi).",
     )
     args = ap.parse_args()
     args.export_all_cells = True

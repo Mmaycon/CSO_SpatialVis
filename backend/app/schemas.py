@@ -3,7 +3,7 @@
 from datetime import datetime
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
 
 
 class SampleRef(BaseModel):
@@ -75,11 +75,21 @@ class ColorColumnsResponse(BaseModel):
     sample_id: str
     metadata_columns: list[str]
     genes: list[str]
+    metadata_column_kinds: dict[str, str] = Field(
+        default_factory=dict,
+        description='Per-column hint: "numeric" (continuous colormap) vs "categorical" (discrete colors)',
+    )
 
 
 class MetadataColumnsResponse(BaseModel):
     sample_id: str
     metadata_columns: list[str]
+
+
+class ImageTranslatePatch(BaseModel):
+    """Shift morphology underlay in micron space; centroids and polygons stay fixed."""
+
+    translate_um: tuple[float, float] = Field(..., description="dx, dy in micrometres")
 
 
 class PlotEnvelope(BaseModel):
@@ -96,6 +106,14 @@ class AnnotationCreate(BaseModel):
     geometry: dict[str, Any]  # GeoJSON Polygon or MultiPolygon
     confidence: float = 1.0
 
+    @field_validator("label")
+    @classmethod
+    def strip_label(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("label cannot be empty")
+        return s
+
 
 class AnnotationByCellIds(BaseModel):
     """Assign ROI label to explicit cell IDs (e.g. rectangle selection) without drawing a polygon."""
@@ -106,6 +124,14 @@ class AnnotationByCellIds(BaseModel):
     notes: str = ""
     cell_ids: list[str]
     confidence: float = 1.0
+
+    @field_validator("label")
+    @classmethod
+    def strip_label(cls, v: str) -> str:
+        s = v.strip()
+        if not s:
+            raise ValueError("label cannot be empty")
+        return s
 
 
 class AnnotationRecord(BaseModel):
@@ -126,6 +152,14 @@ class AnnotationUpdate(BaseModel):
     notes: str | None = None
     geometry: dict[str, Any] | None = None
     confidence: float | None = None
+
+    @field_validator("label")
+    @classmethod
+    def strip_label_opt(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        s = v.strip()
+        return s if s else None
 
 
 class HealthResponse(BaseModel):
