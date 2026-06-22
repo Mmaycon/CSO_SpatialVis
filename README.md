@@ -8,17 +8,117 @@ High-performance **viewer + annotation** tool for precomputed spatial omics. The
 - **Backend:** FastAPI + PostgreSQL (annotations + derived cell tags).
 - **Data:** Parquet on disk (cells, metadata, polygons per LOD, wide expression matrix with column subsets).
 
-### Xenium morphology (many segmentation channels)
+## Export pipelines: required inputs
 
-Under a Xenium **region** output folder you typically find an OME-TIFF such as `morphology_focus/morphology_focus_0000.ome.tif`, `morphology_mip.ome.tif`, or `morphology.ome.tif`. To turn those planes into PNGs the viewer can load, run the exporter from this repo (writes `Images/*.png`, `he.png`, `images_manifest.json`, etc.):
+Both `scripts/xenium_to_spatialvis.py` and `scripts/cosmx_to_spatialvis.py` write the **same CSO_SpatialVis sample folder** under `--out-dir`:
+
+```
+data/my_sample_id/
+  cells.parquet              # cell_id, x, y (micrometers)
+  cell_metadata.parquet      # per-cell metadata columns
+  expression-wide.parquet    # log1p wide matrix (cell_id + gene columns)
+  polygons_lod0.parquet      # segmentation polygons (LOD 0–2)
+  polygons_lod1.parquet
+  polygons_lod2.parquet
+  transcripts/0_0_0.parquet  # optional transcript tile (empty by default)
+  he.png                     # morphology underlay (registration channel)
+  Images/*.png               # per-channel morphology PNGs
+  images_manifest.json       # channel list + micron mapping
+  sample_manifest_entry.json # bounds, layers, image alignment
+  plots/umap.json            # precomputed UMAP (real or synthetic)
+  plots/composition.json
+  pathology_cell_tags.parquet
+```
+
+Point the app at the folder with `CSO_DATA_ROOT=./data` (or place samples under `data/`).
+
+### `xenium_to_spatialvis.py` — 10x Xenium region output
+
+**CLI:** `--xenium-dir` (Xenium **region** folder), `--out-dir` (sample id folder name)
+
+**Required inputs** under `--xenium-dir`:
+
+| Object | Typical path | Used for |
+|--------|--------------|----------|
+| Cell table | `cells.parquet` or `cells.csv[.gz]` | Centroids (`cell_id`, `x`, `y` in **µm**) + metadata columns |
+| Expression matrix | `cell_feature_matrix.h5` or `cell_feature_matrix/` MEX (`matrix.mtx` + barcodes + features) | `expression-wide.parquet` |
+| Cell boundaries | `cell_boundaries.parquet` or `cell_boundaries.csv[.gz]` | `polygons_lod*.parquet` (square footprints if missing) |
+
+**Optional inputs** (recommended for full viewer experience):
+
+| Object | Typical path | Used for |
+|--------|--------------|----------|
+| Morphology OME-TIFF | `morphology_focus/ch0001_*.ome.tif`, … (multi-channel) **or** `morphology_focus/morphology_focus_0000.ome.tif`, `morphology_mip.ome.tif`, `morphology.ome.tif` | `he.png`, `Images/*.png`, `images_manifest.json` |
+| Experiment metadata | `experiment.xenium` | Pixel size (`pixel_um`) for morphology alignment |
+| Analysis CSVs | `analysis/**/umap*.csv`, `analysis/**/clusters.csv` | Real UMAP/composition plots (synthetic if absent) |
+| Transcripts | `transcripts.parquet` or `transcripts.csv[.gz]` | `transcripts/0_0_0.parquet` (only with `--export-transcripts`) |
+
+**Dependencies:** `pip install -r scripts/requirements-xenium-pipeline.txt`
 
 ```bash
 python scripts/xenium_to_spatialvis.py \
   --xenium-dir /path/to/output-...__Region__... \
-  --out-dir ./data/my_sample_id
+  --out-dir ./data/xenium_myregion_full
 ```
 
-In the UI, **Morphology** shows **only the registration/reference plane** chosen in the toolbar. Enable **Multi-channel** (when the export has 2+ planes) to overlay **every** exported segmentation channel with separate toggles and opacity — without blending those planes into the Morphology checkbox.
+Use `scripts/xenium_subset_to_spatialvis.py` with `--n-cells` for a random subset instead of all cells.
+
+### `cosmx_to_spatialvis.py` — CosMx SpatialData Zarr
+
+**CLI:** `--sdata-zarr`, `--out-dir`; optional `--morphology-zarr`, `--transcripts-parquet`
+
+**Required inputs:**
+
+| Object | Typical path | Used for |
+|--------|--------------|----------|
+| SpatialData store | `cosmx.sdata.zarr/` | Root container |
+| AnnData table | `cosmx.sdata.zarr/tables/table/` | Expression (`X`), gene names (`var`), cell metadata (`obs`) |
+| Cell coordinates | `cosmx.sdata.zarr/tables/table/obsm/global` | Centroids in **global pixel** coords (converted to µm via `pixel_size_um`) |
+| Store metadata | `cosmx.sdata.zarr/.zattrs` | `pixel_size_um`, `mosaic_shape_yx` (or `image_shape_yx`) |
+
+**Recommended for morphology** (auto-discovered as sibling `morphology.ome.zarr`, or pass `--morphology-zarr`):
+
+| Object | Typical path | Used for |
+|--------|--------------|----------|
+| OME-NGFF pyramid | `morphology.ome.zarr/` | Full-slide `he.png` + `Images/*.png` (5 channels: PanCK, G, CD298_B2M, CD45, DNA) |
+
+**Optional inputs:**
+
+| Object | Typical path | Used for |
+|--------|--------------|----------|
+| Cell polygons | `cosmx.sdata.zarr/shapes/cell_boundaries/shapes.parquet` | `polygons_lod*.parquet` |
+| Transcript cache | `transcripts.parquet` (beside the zarr) | `transcripts/0_0_0.parquet` (only with `--export-transcripts`) |
+
+**Dependencies:** `pip install -r scripts/requirements-cosmx-pipeline.txt`
+
+```bash
+python scripts/cosmx_to_spatialvis.py \
+  --sdata-zarr /path/to/cosmx.sdata.zarr \
+  --morphology-zarr /path/to/morphology.ome.zarr \
+  --out-dir ./data/GLP1_BrCa_cosmx \
+  --export-all-cells
+```
+
+Re-export morphology only on an existing sample: `--morphology-only`. For CosMx, use `--morphology-flip-y` (default in `scripts/get_cosmx_export.sh`) so the PNG aligns with `obsm['global']` centroids.
+
+### Xenium morphology (UI notes)
+
+See **Export pipelines** above for required Xenium input files. In the UI, **Morphology** shows **only the registration/reference plane** chosen in the toolbar. Enable **Multi-channel** (when the export has 2+ planes) to overlay **every** exported segmentation channel with separate toggles and opacity — without blending those planes into the Morphology checkbox.
+
+### CosMx quick export
+
+If you already built a CosMx SpatialData store (e.g. with `cosmx_to_spatialdata.py`), see the input table above. Convenience wrapper with GLP1 breast cancer defaults:
+
+```bash
+# Quick subset (default 5000 cells)
+bash scripts/get_cosmx_export.sh
+
+# Full sample (~631k cells)
+N_CELLS=0 bash scripts/get_cosmx_export.sh
+```
+
+Defaults point at `/mnt/scratch2/Maycon/Visualization_tools/CosMx_images/GLP1_BrCa/cosmx.sdata.zarr`.
+Conda env (optional): `conda env create -f scripts/conda-cosmx-pipeline.env.yml`.
 
 ## Quick start (Docker)
 
